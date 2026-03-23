@@ -209,13 +209,13 @@ For forensic deployments where the processing machine must be air-gapped or cann
 ```bash
 # After initial authentication, clone the model weights locally
 git lfs install
-git clone https://huggingface.co/pyannote/speaker-diarization-3.1 models/speaker-diarization-3.1
+git clone https://huggingface.co/pyannote/speaker-diarization-community-1 models/speaker-diarization-community-1
 git clone https://huggingface.co/pyannote/segmentation-3.0 models/segmentation-3.0
 ```
 
 Then load via local path in your pipeline code:
 ```python
-pipeline = Pipeline.from_pretrained("models/speaker-diarization-3.1")
+pipeline = Pipeline.from_pretrained("speaker-diarization-community-1")
 ```
 
 pyannote will not attempt any network calls when given a local path.
