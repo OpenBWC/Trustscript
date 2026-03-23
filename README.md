@@ -113,7 +113,7 @@ pip install -r requirements.txt
 pyannote.audio's model weights are hosted on HuggingFace behind a one-time license gate. You only need to do this once per machine.
 
 **a) Accept the license agreements on HuggingFace** (requires a free account):
-- https://huggingface.co/pyannote/speaker-diarization-3.1
+- pyannote/speaker-diarization-community-1
 - https://huggingface.co/pyannote/segmentation-3.0
 
 **b) Authenticate your machine:**
