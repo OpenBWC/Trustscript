@@ -130,8 +130,10 @@ _SILENCE_PERCENTILE: float = 20.0
 #: Frames between the two thresholds are ambiguous and excluded.
 _SPEECH_PERCENTILE: float = 50.0
 
-#: Minimum silence frames required for a reliable noise floor estimate.
-_MIN_SILENCE_FRAMES: int = 10
+#: CV threshold above which the noise floor is considered unstable.
+#: At CV > 0.30 the "silence" frames contain too much energy variation
+#: to represent a stationary noise floor — the SNR estimate is unreliable.
+_NOISE_INSTABILITY_THRESHOLD: float = 0.30
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +299,101 @@ def _detect_clipping(peak_linear: float) -> tuple[bool, float]:
 
 
 # ---------------------------------------------------------------------------
+# Noise floor stationarity check
+# ---------------------------------------------------------------------------
+
+
+def _check_noise_stability(silence_rms: np.ndarray) -> tuple[float | None, bool]:
+    """
+    Measure whether the detected noise floor is stationary using the
+    Coefficient of Variation (CV).
+
+    CV = std(silence_rms) / mean(silence_rms)
+
+    CV measures whether the silence-frame RMS values are tightly clustered
+    (flat, consistent noise floor) or widely spread (variable, chaotic).
+    Unlike raw standard deviation, CV is dimensionless — it scales with
+    the signal level, making it meaningful across files with very different
+    loudness profiles.
+
+    Why stationarity matters for SNR forensic validity
+    ---------------------------------------------------
+    SNR = 20 * log10(mean_speech_rms / mean_silence_rms) assumes the
+    noise floor is stationary — that `mean_silence_rms` is a stable
+    representative value of the background noise throughout the file.
+
+    If the noise floor is non-stationary (e.g. rain, wind gusts, passing
+    traffic, distant shouting), the p20 percentile captures the quietest
+    moments between bursts rather than a true noise floor. The resulting
+    SNR will be over-optimistic — the recording sounds better than it is.
+
+    Example: a BWC recording in heavy rain.
+        - p20 frames catch gaps between the loudest raindrops.
+        - SNR might calculate to a "GOOD" 22 dB because the officer's
+          voice is loud relative to those quiet gaps.
+        - CV will be high because rain energy is highly variable.
+        - noise_is_unstable=True warns downstream: don't trust the 22 dB.
+
+    CV interpretation (thresholds are starting hypotheses — calibrate
+    against a real BWC corpus):
+        CV < 0.15   Stable, stationary noise floor. SNR is trustworthy.
+        0.15–0.30   Moderate variation. SNR is reasonable but not precise.
+        CV > 0.30   Unstable noise floor. SNR may be over-optimistic.
+
+    This check is applied AFTER _MIN_SILENCE_FRAMES is verified.
+    With fewer than ~10 silence frames, std() is statistically meaningless
+    and CV would be noise. The caller is responsible for this guard.
+
+    Parameters
+    ----------
+    silence_rms : np.ndarray
+        RMS values of frames classified as silence by the VAD pass.
+        Must have len >= _MIN_SILENCE_FRAMES (caller's responsibility).
+
+    Returns
+    -------
+    tuple[float | None, bool]
+        (noise_cv, is_unstable)
+        noise_cv: the computed CV value. None if computation fails.
+        is_unstable: True when noise_cv > _NOISE_INSTABILITY_THRESHOLD.
+    """
+    if len(silence_rms) == 0:
+        return None, True
+
+    mean_silence = float(np.mean(silence_rms))
+    std_silence = float(np.std(silence_rms))
+
+    # _EPSILON prevents division by zero for effectively-silent noise floors.
+    noise_cv = std_silence / (mean_silence + _EPSILON)
+    is_unstable = noise_cv > _NOISE_INSTABILITY_THRESHOLD
+
+    if is_unstable:
+        logger.warning(
+            "Unstable noise floor detected: CV=%.3f (threshold: %.2f). "
+            "The silence frames show high energy variation — the SNR "
+            "estimate may be over-optimistic. Possible causes: rain, "
+            "wind gusts, distant shouting, non-stationary background noise.",
+            noise_cv,
+            _NOISE_INSTABILITY_THRESHOLD,
+        )
+    else:
+        logger.debug(
+            "Noise floor is stable: CV=%.3f (threshold: %.2f).",
+            noise_cv,
+            _NOISE_INSTABILITY_THRESHOLD,
+        )
+
+    return float(noise_cv), is_unstable
+
+
+# ---------------------------------------------------------------------------
 # SNR estimation
 # ---------------------------------------------------------------------------
 
 
 def _estimate_snr(
     rms_values: list[float],
-) -> tuple[float | None, float | None, str | None, dict[str, float]]:
+) -> tuple[float | None, float | None, str | None, dict[str, float], float | None, bool]:
     """
     Estimate SNR from the per-frame RMS list using percentile-based VAD.
 
@@ -318,6 +408,10 @@ def _estimate_snr(
 
     SNR = 20 * log10(mean_speech_rms / mean_silence_rms)
 
+    After computing SNR, a stationarity check is run on the silence
+    frames to validate whether the noise floor is reliable. See
+    _check_noise_stability() for full rationale.
+
     Parameters
     ----------
     rms_values : list[float]
@@ -325,24 +419,29 @@ def _estimate_snr(
 
     Returns
     -------
-    tuple[float | None, float | None, str | None, dict[str, float]]
-        (snr_db, speech_fraction, note, energy_percentiles)
+    tuple[float|None, float|None, str|None, dict, float|None, bool]
+        (snr_db, speech_fraction, note, energy_percentiles,
+         noise_cv, noise_is_unstable)
         snr_db: SNR in dB, or None if estimation failed.
         speech_fraction: fraction of frames classified as speech.
         note: human-readable caveat, or None if clean.
-        energy_percentiles: {p10, p20, p50, p80, p90} RMS values for
-                            output JSON — evidence for SNR classification.
+        energy_percentiles: {p10, p20, p50, p80, p90} for output JSON.
+        noise_cv: Coefficient of Variation of silence frames, or None.
+        noise_is_unstable: True when noise_cv > _NOISE_INSTABILITY_THRESHOLD.
     """
     rms_array = np.array(rms_values, dtype=np.float32)
     total_frames = len(rms_array)
 
     # Compute energy percentile summary for output metadata.
-    # A reviewer can inspect these to understand why a file was flagged.
     pct_keys = [10, 20, 50, 80, 90]
     energy_percentiles = {
         f"p{p}": float(np.percentile(rms_array, p))
         for p in pct_keys
     }
+
+    # Default stability values — overwritten below if computation succeeds.
+    noise_cv: float | None = None
+    noise_is_unstable: bool = False
 
     if total_frames < 10:
         note = (
@@ -350,7 +449,7 @@ def _estimate_snr(
             "audio too short for reliable SNR estimation."
         )
         logger.warning(note)
-        return None, None, note, energy_percentiles
+        return None, None, note, energy_percentiles, noise_cv, noise_is_unstable
 
     silence_threshold = np.percentile(rms_array, _SILENCE_PERCENTILE)
     speech_threshold = np.percentile(rms_array, _SPEECH_PERCENTILE)
@@ -377,7 +476,7 @@ def _estimate_snr(
             "Audio may be continuous speech — SNR estimate unreliable."
         )
         logger.warning("SNR skipped: %s", note)
-        return None, speech_fraction, note, energy_percentiles
+        return None, speech_fraction, note, energy_percentiles, noise_cv, noise_is_unstable
 
     if len(speech_rms) == 0:
         note = (
@@ -385,7 +484,14 @@ def _estimate_snr(
             "Audio may be near-silent or contain only background noise."
         )
         logger.warning("SNR skipped: %s", note)
-        return None, speech_fraction, note, energy_percentiles
+        return None, speech_fraction, note, energy_percentiles, noise_cv, noise_is_unstable
+
+    # ------------------------------------------------------------------
+    # Noise floor stationarity check.
+    # Applied after _MIN_SILENCE_FRAMES guard — std() is statistically
+    # meaningless on very small samples.
+    # ------------------------------------------------------------------
+    noise_cv, noise_is_unstable = _check_noise_stability(silence_rms)
 
     mean_speech_rms = float(np.mean(speech_rms))
     mean_silence_rms = float(np.mean(silence_rms))
@@ -396,16 +502,29 @@ def _estimate_snr(
             "pre-processed. SNR capped at 60 dB."
         )
         logger.debug(note)
-        return 60.0, speech_fraction, note, energy_percentiles
+        return 60.0, speech_fraction, note, energy_percentiles, noise_cv, noise_is_unstable
 
     snr_db = 20.0 * np.log10(mean_speech_rms / mean_silence_rms)
 
+    # If noise is unstable, append a caveat to the note without
+    # changing the SNR value itself. The raw measurement is preserved.
+    # Phase 4 Fusion uses noise_is_unstable independently.
+    note = None
+    if noise_is_unstable:
+        note = (
+            f"Noise floor is non-stationary (CV={noise_cv:.3f} > "
+            f"{_NOISE_INSTABILITY_THRESHOLD}). SNR of {snr_db:.1f} dB "
+            "may be over-optimistic — background environment is chaotic. "
+            "Phase 4 Fusion should weight this file's confidence scores down."
+        )
+
     logger.debug(
-        "SNR: %.1f dB (speech RMS: %.6f, noise RMS: %.6f)",
+        "SNR: %.1f dB (speech RMS: %.6f, noise RMS: %.6f, noise CV: %s)",
         snr_db, mean_speech_rms, mean_silence_rms,
+        f"{noise_cv:.3f}" if noise_cv is not None else "n/a",
     )
 
-    return float(snr_db), speech_fraction, None, energy_percentiles
+    return float(snr_db), speech_fraction, note, energy_percentiles, noise_cv, noise_is_unstable
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +635,8 @@ def run_stage2(
         speech_fraction = None
         snr_note = "Waveform streaming failed — measurements unavailable."
         energy_percentiles: dict[str, float] = {}
+        noise_cv: float | None = None
+        noise_is_unstable: bool = False
     else:
         rms_values, peak_linear = stream_result
 
@@ -527,7 +648,7 @@ def run_stage2(
         # ------------------------------------------------------------------
         # Step 4: SNR estimation from RMS histogram.
         # ------------------------------------------------------------------
-        snr_db, speech_fraction, snr_note, energy_percentiles = (
+        snr_db, speech_fraction, snr_note, energy_percentiles, noise_cv, noise_is_unstable = (
             _estimate_snr(rms_values)
         )
 
@@ -557,6 +678,8 @@ def run_stage2(
         snr_flagged=snr_flagged,
         vad_speech_fraction=speech_fraction,
         vad_energy_percentiles=energy_percentiles,
+        noise_stability_cv=noise_cv,
+        noise_is_unstable=noise_is_unstable,
         snr_note=snr_note,
     )
 
