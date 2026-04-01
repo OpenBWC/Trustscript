@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trustscript"
+version = "0.1.0"
+description = "Forensic-grade speaker diarization pipeline for body-worn camera footage"
+requires-python = ">=3.11"
+readme = "README.md"
+
+# Minimal dependencies needed for the CLI to load.
+# Full pipeline dependencies are in requirements.txt.
+dependencies = [
+    "click",
+    "rich",
+    "python-dotenv",
+]
+
+[project.scripts]
+# This is what makes `trustscript` available as a terminal command.
+# Points to the trustscript Click group in src/cli/__init__.py.
+trustscript = "src.cli:trustscript"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
