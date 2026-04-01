@@ -39,6 +39,7 @@ Stages not yet implemented (added here as they are built):
 """
 
 from .exceptions import AudioIngestionError, FFprobeError
+from .extraction import FORMATS_NEEDING_EXTRACTION, FORMATS_SOUNDFILE_NATIVE, extract_working_audio
 from .models import (
     AudioProperties,
     AudioQualityProfile,
@@ -56,6 +57,7 @@ from .stage1 import (
 __all__ = [
     # Stage entry points
     "run_stage1",
+    "extract_working_audio",
     "run_stage2",
     # Stage 1 result types
     "Stage1Result",
@@ -68,6 +70,8 @@ __all__ = [
     "LoudnessProperties",
     # Constants
     "ALL_SUPPORTED_FORMATS",
+    "FORMATS_NEEDING_EXTRACTION",
+    "FORMATS_SOUNDFILE_NATIVE",
     # Exceptions
     "AudioIngestionError",
     "FFprobeError",
