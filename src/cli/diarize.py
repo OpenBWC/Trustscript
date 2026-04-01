@@ -346,14 +346,29 @@ def _run_diarize_pipeline(
 
     # ------------------------------------------------------------------
     # Stage 2 — Audio Quality Profiling
-    # Status:  NOT IMPLEMENTED
-    # File:    src/utils/audio/profiling.py  (to be created)
+    # Status:  IMPLEMENTED
+    # File:    src/utils/audio/profiling.py
     # ------------------------------------------------------------------
     log.info("Stage 2 — Audio Quality Profiling")
-    raise NotImplementedError(
-        "Stage 2 (Audio Quality Profiling) is not yet implemented. "
-        "See Phase 1 spec Stage 2 and src/utils/audio/profiling.py."
-    )
+
+    from src.utils.audio import run_stage2
+
+    stage2_result = run_stage2(stage1_result)
+
+    if verbose:
+        aq = stage2_result.audio_quality
+        snr_str = f"{aq.snr_db:.1f} dB" if aq.snr_db is not None else "unknown"
+        console.print(
+            f"  [dim]SNR:[/dim]          {snr_str} ({aq.snr_classification})"
+            f"{'  [yellow]⚠ flagged[/yellow]' if aq.snr_flagged else ''}\n"
+            f"  [dim]clipping:[/dim]     {aq.clipping_detected}\n"
+            f"  [dim]peak:[/dim]         "
+            f"{f'{aq.clipping_peak_dbfs:.2f} dBFS' if aq.clipping_peak_dbfs is not None else 'unknown'}\n"
+            f"  [dim]speech:[/dim]       "
+            f"{f'{aq.vad_speech_fraction:.0%}' if aq.vad_speech_fraction is not None else 'unknown'}"
+        )
+        if aq.snr_note:
+            console.print(f"  [dim]SNR note:[/dim]     {aq.snr_note}")
 
     # ------------------------------------------------------------------
     # Stage 3 — Normalization
