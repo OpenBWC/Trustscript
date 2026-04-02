@@ -5,85 +5,64 @@ TrustScript Phase 1 — Stage 2: Audio Quality Profiling
 
 Responsibility
 --------------
-Characterize the raw input file's audio quality before normalization.
-All measurements reflect true recording conditions, not processed output.
-This module is strictly read-only — no files are written or modified.
-
-Reads from the working audio path produced by extraction.py, which is
-a PCM WAV at the original sample rate and channel count.
+Characterize raw input audio quality before normalization, with all
+measurements anchored to Signal Time (sample offsets in the original
+file's sample space).
 
 Measurements produced
 ---------------------
-    - Duration, original sample rate, original channel count
-      (sourced from Stage 1 ffprobe output — no re-probe needed)
-    - Peak amplitude and clipping detection (peak > -1 dBFS)
-    - Estimated SNR via energy-based Voice Activity Detection (VAD)
-    - Per-frame RMS energy percentile summary (written to output JSON
-      as diagnostic evidence for SNR classification)
+    file_level      — aggregate quality summary across the full file
+    quality_windows — 30-second non-overlapping quality slices
+    quality_events  — contiguous zones of degraded audio quality
 
-Memory design: soundfile.blocks() streaming
---------------------------------------------
-Stage 2 uses soundfile.blocks() to stream audio frame-by-frame rather
-than loading the full waveform into memory.
+Signal Time architecture
+------------------------
+Every measurement that references a position in the audio carries a
+sample offset as its primary key:
 
-    Full waveform load:      ~460 MB for a 2-hour 48kHz file
-    soundfile.blocks():      one 20ms frame at a time (~18 KB at 48kHz)
-                             + RMS list (~2.9 MB for 2 hours)
+    start_sample: int   ← primary key, integer, never accumulated
+    start_seconds: float ← derived display value only
 
-soundfile is purpose-built for audio I/O: faster than ffmpeg for WAV
-reads, better Python integration, and cleaner EOF handling. It is used
-here instead of the previous ffmpeg Popen streaming approach now that
-the extraction step guarantees a native WAV on disk.
+The conversion is computed once per frame from the original sample rate:
 
-Stereo handling
----------------
-soundfile.blocks() returns a 2D array of shape (n_samples, n_channels)
-for stereo files. RMS computation requires a 1D array. Stereo blocks
-are downmixed to mono on the fly before each RMS calculation:
+    analysis_sample  = frame_index * FRAME_SAMPLES
+    original_sample  = round(analysis_sample * (original_sr / 16000))
+    seconds          = original_sample / original_sr
 
-    block = block.mean(axis=1)  # (n, 2) → (n,)
+Using integer sample arithmetic prevents IEEE 754 floating point
+accumulation error. At 48kHz over 2 hours, naive floating-point
+accumulation can drift by several samples — in forensic audio, the
+difference between adjacent samples may have evidentiary significance.
 
-This is a per-frame operation on a ~18KB array — no full-file downmix
-is held in memory.
-
-Non-overlapping frames
+Streaming architecture
 -----------------------
-Stage 2 uses non-overlapping 20ms frames (blocksize = frame_samples,
-no overlap). For statistical profiling — building an RMS histogram to
-locate the noise floor — 50 frames per second provides more than
-sufficient density. The previous 10ms hop (50% overlap) was unnecessary
-for this use case and doubled the number of frames to store.
+Audio is read via soundfile.blocks() — one 20ms frame at a time.
+Peak amplitude and per-frame RMS values accumulate in-memory during
+the streaming pass. The working WAV is never loaded in full.
 
-VAD method — energy-based (not pyannote)
------------------------------------------
-pyannote model loading is Stage 4. Requiring neural model downloads
-for a quality profiling pass would:
-    1. Block Stage 2 on HuggingFace authentication.
-    2. Pay the model loading cost twice per pipeline run.
-    3. Break Stage 2's "lightweight, read-only" design contract.
+    Full waveform load:       ~460 MB for a 2-hour 48kHz file
+    Streaming approach:       one frame (~7.5 KB stereo) at a time
+                              + arrays: ~5.8 MB total for 2 hours
 
-Energy-based VAD requires no model, no auth, and minimal RAM. It
-reliably distinguishes clean from noisy recordings for the purpose of
-snr_flagged classification.
+Two-pass approach
+-----------------
+1. Streaming pass: collect rms_per_frame and peak_per_frame arrays.
+2. Computation pass: compute sliding-window SNR series, build quality
+   windows, detect quality events. All computation uses the arrays
+   from pass 1 — no second file read.
 
-A refined SNR using pyannote's actual VAD output is computed in Stage 5.
-
-SNR reference thresholds (starting hypotheses)
------------------------------------------------
-Calibrate by plotting SNR vs. reid_score across a real BWC corpus.
-
-    > 30 dB  EXCELLENT   Clean indoor, close mic
-    20-30 dB GOOD        Normal outdoor, light wind
-    15-20 dB MODERATE    Active scene, siren/radio
-    10-15 dB POOR        Heavy wind, multiple sirens
-    < 10 dB  CRITICAL    Near-unusable — flag for human review
+VAD method
+----------
+Energy-based frame-level VAD. No neural model, no HuggingFace auth.
+Percentile-based thresholds are self-calibrating to each file's energy
+distribution. A refined pyannote-VAD SNR is produced in Stage 5.
 
 Contributors
 ------------
-    VAD parameters (_SILENCE_PERCENTILE, _SPEECH_PERCENTILE) and SNR
-    thresholds (_SNR_THRESHOLDS) are tunable. After collecting a corpus
-    of real BWC files, update thresholds with empirically calibrated
-    values and document the calibration dataset in a comment.
+    Tunable constants: _SILENCE_PERCENTILE, _SPEECH_PERCENTILE,
+    _NOISE_INSTABILITY_THRESHOLD, _SNR_THRESHOLDS.
+    After collecting a real BWC corpus, calibrate these and document
+    the dataset used.
 """
 
 import logging
@@ -92,31 +71,27 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .events import EventDetector, _SlidingWindowResult
 from .models import AudioQualityProfile, Stage2Result
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Clipping detection
+# Analysis parameters
 # ---------------------------------------------------------------------------
 
-#: Standard forensic audio clipping threshold in dBFS.
-CLIPPING_THRESHOLD_DBFS: float = -1.0
-
-#: Linear amplitude equivalent: 10^(-1/20) ≈ 0.8913.
-_CLIPPING_THRESHOLD_LINEAR: float = 10 ** (CLIPPING_THRESHOLD_DBFS / 20.0)
-
-
-# ---------------------------------------------------------------------------
-# Frame parameters
-# ---------------------------------------------------------------------------
+#: Sample rate used for the profiling analysis pass.
+#: Original sample rate is preserved from Stage 1 and written to output.
+_ANALYSIS_SAMPLE_RATE: int = 16_000
 
 #: Frame duration in milliseconds. 20ms is standard for speech processing.
 _FRAME_DURATION_MS: float = 20.0
 
-#: Epsilon to prevent log(0) errors.
-_EPSILON: float = 1e-10
+#: Samples per analysis frame at _ANALYSIS_SAMPLE_RATE.
+_FRAME_SAMPLES: int = int(_ANALYSIS_SAMPLE_RATE * _FRAME_DURATION_MS / 1000.0)
+
+#: soundfile read timeout is managed by the OS — no explicit timeout needed.
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +102,33 @@ _EPSILON: float = 1e-10
 _SILENCE_PERCENTILE: float = 20.0
 
 #: Frames at or above this RMS percentile are classified as speech.
-#: Frames between the two thresholds are ambiguous and excluded.
+#: Frames between the two percentiles are ambiguous and excluded.
 _SPEECH_PERCENTILE: float = 50.0
 
-#: CV threshold above which the noise floor is considered unstable.
-#: At CV > 0.30 the "silence" frames contain too much energy variation
-#: to represent a stationary noise floor — the SNR estimate is unreliable.
+#: Minimum silence frames for a reliable noise floor estimate.
+_MIN_SILENCE_FRAMES: int = 10
+
+#: Epsilon to prevent log(0) and division-by-zero.
+_EPSILON: float = 1e-10
+
+
+# ---------------------------------------------------------------------------
+# Noise stationarity
+# ---------------------------------------------------------------------------
+
+#: CV above this threshold indicates a non-stationary noise floor.
 _NOISE_INSTABILITY_THRESHOLD: float = 0.30
+
+
+# ---------------------------------------------------------------------------
+# Sliding window parameters
+# ---------------------------------------------------------------------------
+
+#: Sliding window duration in seconds for per-window SNR computation.
+_SLIDING_WINDOW_SECONDS: float = 5.0
+
+#: Hop between sliding window positions in seconds.
+_SLIDING_HOP_SECONDS: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -149,148 +144,140 @@ _SNR_THRESHOLDS: list[tuple[float, str, bool]] = [
     (float("-inf"), "CRITICAL",  True),
 ]
 
+#: Linear amplitude equivalent of -1 dBFS clipping threshold.
+_CLIPPING_THRESHOLD_LINEAR: float = 10 ** (-1.0 / 20.0)  # ≈ 0.8913
+
 
 # ---------------------------------------------------------------------------
-# Core streaming pass
+# Streaming pass
 # ---------------------------------------------------------------------------
 
 
-def _stream_frame_rms(
+def _stream_frame_arrays(
     working_audio_path: Path,
-    sample_rate: int,
-) -> tuple[list[float], float] | None:
+    original_sample_rate: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
     """
-    Stream the working WAV via soundfile.blocks() and compute per-frame
-    RMS energy on the fly.
+    Stream the working WAV via soundfile.blocks() and collect per-frame
+    RMS and peak amplitude arrays.
 
     This is the single I/O pass for Stage 2. Both clipping detection and
-    SNR estimation derive from the data collected here.
+    SNR estimation derive from the arrays returned here.
 
     Memory profile
     --------------
-    At any moment, one 20ms frame is held as a numpy array. At 48kHz
-    stereo that is (960, 2) float32 ≈ 7.5 KB. The frame is processed
-    immediately and discarded. What accumulates is the RMS list:
-    one float32 per frame.
-
-        2-hour file at 48kHz: ~360,000 frames → ~2.9 MB
+    One 20ms frame is in RAM at a time. At 48kHz stereo:
+        frame shape: (960, 2) float32 ≈ 7.5 KB
+    What accumulates:
+        rms_per_frame:  one float32 per frame  ≈ 2.9 MB for 2 hours
+        peak_per_frame: one float32 per frame  ≈ 2.9 MB for 2 hours
 
     Stereo handling
     ---------------
     soundfile returns shape (n_samples, n_channels) for multi-channel
-    audio. Multi-channel blocks are averaged across the channel axis
-    to produce a mono representation before RMS computation:
-
+    audio. Each block is averaged across channels before RMS/peak
+    computation:
         block.mean(axis=1)  →  (n_samples,)
 
-    This per-frame downmix uses ~7.5 KB at a time — no full-file
-    stereo-to-mono array is ever allocated.
+    Signal Time anchoring
+    ---------------------
+    The arrays are indexed by frame number. Frame i starts at:
+        original_start_sample = round(
+            i * FRAME_SAMPLES * (original_sr / ANALYSIS_SR)
+        )
+    This conversion is performed by EventDetector.frame_to_original_sample().
 
     Parameters
     ----------
     working_audio_path : Path
-        Path to the working PCM WAV produced by extraction.py.
-    sample_rate : int
-        Original sample rate from Stage 1 AudioProperties. Used to
-        compute the correct frame size in samples.
+        Working PCM f32le WAV from extraction.py.
+    original_sample_rate : int
+        Original sample rate from Stage 1. Used to log correct duration.
 
     Returns
     -------
-    tuple[list[float], float] | None
-        (rms_per_frame, peak_linear_amplitude)
+    tuple[np.ndarray, np.ndarray] | None
+        (rms_per_frame, peak_per_frame) as float32 arrays.
         None if soundfile fails to open or read the file.
     """
-    # Frame size in samples at the original sample rate.
-    frame_samples = int(sample_rate * _FRAME_DURATION_MS / 1000.0)
-
-    rms_values: list[float] = []
-    peak_linear: float = 0.0
+    rms_list: list[float] = []
+    peak_list: list[float] = []
 
     try:
-        # soundfile.blocks() streams non-overlapping blocks of frame_samples.
-        # overlap=0 is the default but stated explicitly for clarity.
         for block in sf.blocks(
             working_audio_path,
-            blocksize=frame_samples,
+            blocksize=_FRAME_SAMPLES,
             overlap=0,
             dtype="float32",
         ):
             if block.size == 0:
                 continue
 
-            # Downmix to mono on the fly if multi-channel.
-            # block.ndim == 1 for mono, 2 for stereo/multichannel.
+            # Downmix to mono on the fly — no full-file mono array allocated.
             if block.ndim == 2:
                 block = block.mean(axis=1)
 
-            frame_rms = float(np.sqrt(np.mean(block ** 2)))
-            rms_values.append(frame_rms)
-
-            frame_peak = float(np.max(np.abs(block)))
-            if frame_peak > peak_linear:
-                peak_linear = frame_peak
+            rms_list.append(float(np.sqrt(np.mean(block ** 2))))
+            peak_list.append(float(np.max(np.abs(block))))
 
     except sf.SoundFileError as e:
         logger.warning(
-            "soundfile failed to read %s: %s — "
-            "clipping and SNR measurements unavailable.",
+            "soundfile failed to read %s: %s",
             working_audio_path.name, e,
         )
         return None
     except Exception as e:
         logger.warning(
-            "Unexpected error reading %s: %s — "
-            "clipping and SNR measurements unavailable.",
+            "Unexpected error reading %s: %s",
             working_audio_path.name, e,
         )
         return None
 
-    if not rms_values:
-        logger.warning(
-            "No audio frames read from %s. "
-            "File may contain no audio content.",
-            working_audio_path.name,
-        )
+    if not rms_list:
+        logger.warning("No frames read from %s.", working_audio_path.name)
         return None
 
+    rms_array = np.array(rms_list, dtype=np.float32)
+    peak_array = np.array(peak_list, dtype=np.float32)
+
     logger.debug(
-        "Streamed %s: %d frames at %d Hz (%.1f seconds), peak: %.4f",
+        "Streamed %s: %d frames at %d Hz (%.1f seconds)",
         working_audio_path.name,
-        len(rms_values),
-        sample_rate,
-        len(rms_values) * _FRAME_DURATION_MS / 1000.0,
-        peak_linear,
+        len(rms_list),
+        _ANALYSIS_SAMPLE_RATE,
+        len(rms_list) * _FRAME_DURATION_MS / 1000.0,
     )
 
-    return rms_values, peak_linear
+    return rms_array, peak_array
 
 
 # ---------------------------------------------------------------------------
-# Clipping detection
+# Clipping detection (file-level)
 # ---------------------------------------------------------------------------
 
 
-def _detect_clipping(peak_linear: float) -> tuple[bool, float]:
+def _detect_clipping(peak_array: np.ndarray) -> tuple[bool, float]:
     """
-    Determine whether peak amplitude exceeds the clipping threshold.
+    Detect digital clipping from the full-file peak amplitude array.
 
     Parameters
     ----------
-    peak_linear : float
-        Maximum absolute amplitude across all frames in [0.0, 1.0].
+    peak_array : np.ndarray
+        Per-frame peak amplitude values from _stream_frame_arrays().
 
     Returns
     -------
     tuple[bool, float]
         (clipping_detected, peak_dbfs)
     """
+    peak_linear = float(np.max(peak_array))
     peak_dbfs = 20.0 * np.log10(peak_linear + _EPSILON)
-    clipping = peak_dbfs >= CLIPPING_THRESHOLD_DBFS
+    clipping = peak_dbfs >= -1.0
 
     if clipping:
         logger.warning(
-            "Clipping detected: peak %.2f dBFS (threshold: %.1f dBFS).",
-            peak_dbfs, CLIPPING_THRESHOLD_DBFS,
+            "Clipping detected: peak %.2f dBFS (threshold: -1.0 dBFS).",
+            peak_dbfs,
         )
     else:
         logger.debug("No clipping. Peak: %.2f dBFS", peak_dbfs)
@@ -299,260 +286,216 @@ def _detect_clipping(peak_linear: float) -> tuple[bool, float]:
 
 
 # ---------------------------------------------------------------------------
-# Noise floor stationarity check
+# File-level VAD thresholds
 # ---------------------------------------------------------------------------
 
 
-def _check_noise_stability(silence_rms: np.ndarray) -> tuple[float | None, bool]:
+def _compute_vad_thresholds(
+    rms_array: np.ndarray,
+) -> tuple[float, float, float | None]:
     """
-    Measure whether the detected noise floor is stationary using the
-    Coefficient of Variation (CV).
+    Compute global silence/speech thresholds from the full-file RMS array.
 
-    CV = std(silence_rms) / mean(silence_rms)
-
-    CV measures whether the silence-frame RMS values are tightly clustered
-    (flat, consistent noise floor) or widely spread (variable, chaotic).
-    Unlike raw standard deviation, CV is dimensionless — it scales with
-    the signal level, making it meaningful across files with very different
-    loudness profiles.
-
-    Why stationarity matters for SNR forensic validity
-    ---------------------------------------------------
-    SNR = 20 * log10(mean_speech_rms / mean_silence_rms) assumes the
-    noise floor is stationary — that `mean_silence_rms` is a stable
-    representative value of the background noise throughout the file.
-
-    If the noise floor is non-stationary (e.g. rain, wind gusts, passing
-    traffic, distant shouting), the p20 percentile captures the quietest
-    moments between bursts rather than a true noise floor. The resulting
-    SNR will be over-optimistic — the recording sounds better than it is.
-
-    Example: a BWC recording in heavy rain.
-        - p20 frames catch gaps between the loudest raindrops.
-        - SNR might calculate to a "GOOD" 22 dB because the officer's
-          voice is loud relative to those quiet gaps.
-        - CV will be high because rain energy is highly variable.
-        - noise_is_unstable=True warns downstream: don't trust the 22 dB.
-
-    CV interpretation (thresholds are starting hypotheses — calibrate
-    against a real BWC corpus):
-        CV < 0.15   Stable, stationary noise floor. SNR is trustworthy.
-        0.15–0.30   Moderate variation. SNR is reasonable but not precise.
-        CV > 0.30   Unstable noise floor. SNR may be over-optimistic.
-
-    This check is applied AFTER _MIN_SILENCE_FRAMES is verified.
-    With fewer than ~10 silence frames, std() is statistically meaningless
-    and CV would be noise. The caller is responsible for this guard.
+    These thresholds are computed once from the full file and used
+    consistently across all sliding windows and quality windows.
+    Per-window local thresholds would be inconsistent and make
+    cross-window comparisons meaningless.
 
     Parameters
     ----------
-    silence_rms : np.ndarray
-        RMS values of frames classified as silence by the VAD pass.
-        Must have len >= _MIN_SILENCE_FRAMES (caller's responsibility).
+    rms_array : np.ndarray
+        Per-frame RMS values for the full file.
 
     Returns
     -------
-    tuple[float | None, bool]
-        (noise_cv, is_unstable)
-        noise_cv: the computed CV value. None if computation fails.
-        is_unstable: True when noise_cv > _NOISE_INSTABILITY_THRESHOLD.
+    tuple[float, float, float | None]
+        (silence_threshold, speech_threshold, speech_fraction)
+        speech_fraction: fraction of frames above speech_threshold.
+        None if the array is too short for percentile computation.
     """
-    if len(silence_rms) == 0:
-        return None, True
+    if len(rms_array) < 10:
+        return 0.0, float("inf"), None
 
-    mean_silence = float(np.mean(silence_rms))
-    std_silence = float(np.std(silence_rms))
+    silence_threshold = float(np.percentile(rms_array, _SILENCE_PERCENTILE))
+    speech_threshold = float(np.percentile(rms_array, _SPEECH_PERCENTILE))
+    speech_fraction = float(np.mean(rms_array >= speech_threshold))
 
-    # _EPSILON prevents division by zero for effectively-silent noise floors.
-    noise_cv = std_silence / (mean_silence + _EPSILON)
-    is_unstable = noise_cv > _NOISE_INSTABILITY_THRESHOLD
-
-    if is_unstable:
-        logger.warning(
-            "Unstable noise floor detected: CV=%.3f (threshold: %.2f). "
-            "The silence frames show high energy variation — the SNR "
-            "estimate may be over-optimistic. Possible causes: rain, "
-            "wind gusts, distant shouting, non-stationary background noise.",
-            noise_cv,
-            _NOISE_INSTABILITY_THRESHOLD,
-        )
-    else:
-        logger.debug(
-            "Noise floor is stable: CV=%.3f (threshold: %.2f).",
-            noise_cv,
-            _NOISE_INSTABILITY_THRESHOLD,
-        )
-
-    return float(noise_cv), is_unstable
+    return silence_threshold, speech_threshold, speech_fraction
 
 
 # ---------------------------------------------------------------------------
-# SNR estimation
+# Sliding window SNR series
 # ---------------------------------------------------------------------------
 
 
-def _estimate_snr(
-    rms_values: list[float],
-) -> tuple[float | None, float | None, str | None, dict[str, float], float | None, bool]:
+def _compute_sliding_window_snrs(
+    rms_array: np.ndarray,
+    peak_array: np.ndarray,
+    silence_threshold: float,
+    speech_threshold: float,
+    detector: EventDetector,
+) -> list[_SlidingWindowResult]:
     """
-    Estimate SNR from the per-frame RMS list using percentile-based VAD.
+    Compute per-window SNR and stability using a sliding window over
+    the per-frame RMS array.
 
-    The RMS list is treated as an energy histogram. Speech and silence
-    frames are identified by their position in the distribution rather
-    than a fixed threshold, making the classification adaptive to each
-    file's own energy profile.
+    Window and hop are expressed in frames (derived from seconds), not
+    seconds directly — this avoids floating point accumulation in the
+    window positioning loop.
 
-        silence:   frames at or below _SILENCE_PERCENTILE (20th pct)
-        speech:    frames at or above _SPEECH_PERCENTILE  (50th pct)
-        ambiguous: frames in between — excluded from SNR computation
-
-    SNR = 20 * log10(mean_speech_rms / mean_silence_rms)
-
-    After computing SNR, a stationarity check is run on the silence
-    frames to validate whether the noise floor is reliable. See
-    _check_noise_stability() for full rationale.
+    Signal Time anchors
+    -------------------
+    Each window's start_sample and end_sample are computed by calling
+    detector.frame_to_original_sample(), which uses integer arithmetic
+    in the original sample space. start_seconds and end_seconds are
+    derived display values only.
 
     Parameters
     ----------
-    rms_values : list[float]
-        Per-frame RMS values from _stream_frame_rms().
+    rms_array : np.ndarray
+        Per-frame RMS values from the streaming pass.
+    peak_array : np.ndarray
+        Per-frame peak amplitude values from the streaming pass.
+    silence_threshold : float
+        Global silence threshold from _compute_vad_thresholds().
+    speech_threshold : float
+        Global speech threshold from _compute_vad_thresholds().
+    detector : EventDetector
+        For Signal Time conversions.
 
     Returns
     -------
-    tuple[float|None, float|None, str|None, dict, float|None, bool]
-        (snr_db, speech_fraction, note, energy_percentiles,
-         noise_cv, noise_is_unstable)
-        snr_db: SNR in dB, or None if estimation failed.
-        speech_fraction: fraction of frames classified as speech.
-        note: human-readable caveat, or None if clean.
-        energy_percentiles: {p10, p20, p50, p80, p90} for output JSON.
-        noise_cv: Coefficient of Variation of silence frames, or None.
-        noise_is_unstable: True when noise_cv > _NOISE_INSTABILITY_THRESHOLD.
+    list[_SlidingWindowResult]
+        One entry per sliding window position, ordered by start_frame.
     """
-    rms_array = np.array(rms_values, dtype=np.float32)
-    total_frames = len(rms_array)
+    window_frames = int(_SLIDING_WINDOW_SECONDS * 1000 / _FRAME_DURATION_MS)
+    hop_frames = int(_SLIDING_HOP_SECONDS * 1000 / _FRAME_DURATION_MS)
+    n_frames = len(rms_array)
+    results: list[_SlidingWindowResult] = []
 
-    # Compute energy percentile summary for output metadata.
-    pct_keys = [10, 20, 50, 80, 90]
-    energy_percentiles = {
-        f"p{p}": float(np.percentile(rms_array, p))
-        for p in pct_keys
-    }
+    for start_frame in range(0, n_frames - window_frames + 1, hop_frames):
+        end_frame = start_frame + window_frames
+        window_rms = rms_array[start_frame:end_frame]
+        window_peak = peak_array[start_frame:end_frame]
 
-    # Default stability values — overwritten below if computation succeeds.
-    noise_cv: float | None = None
-    noise_is_unstable: bool = False
+        # Signal Time anchors — integer sample offsets, not accumulated floats.
+        start_sample = detector.frame_to_original_sample(start_frame)
+        end_sample = detector.frame_to_original_sample(end_frame)
+        start_seconds = start_sample / detector.original_sr
+        end_seconds = end_sample / detector.original_sr
 
-    if total_frames < 10:
-        note = (
-            f"Only {total_frames} frame(s) — "
-            "audio too short for reliable SNR estimation."
-        )
-        logger.warning(note)
-        return None, None, note, energy_percentiles, noise_cv, noise_is_unstable
+        # Local speech/silence using global thresholds.
+        silence_frames = window_rms[window_rms <= silence_threshold]
+        speech_frames = window_rms[window_rms >= speech_threshold]
+        speech_fraction = float(len(speech_frames)) / len(window_rms)
 
-    silence_threshold = np.percentile(rms_array, _SILENCE_PERCENTILE)
-    speech_threshold = np.percentile(rms_array, _SPEECH_PERCENTILE)
+        # Local SNR.
+        snr_db: float | None = None
+        if len(silence_frames) >= _MIN_SILENCE_FRAMES and len(speech_frames) > 0:
+            mean_speech = float(np.mean(speech_frames))
+            mean_silence = float(np.mean(silence_frames))
+            if mean_silence > _EPSILON:
+                snr_db = float(20.0 * np.log10(mean_speech / mean_silence))
 
-    silence_mask = rms_array <= silence_threshold
-    speech_mask = rms_array >= speech_threshold
+        # Local noise stability (CV).
+        noise_cv: float | None = None
+        if len(silence_frames) >= _MIN_SILENCE_FRAMES:
+            mean_sil = float(np.mean(silence_frames))
+            std_sil = float(np.std(silence_frames))
+            noise_cv = std_sil / (mean_sil + _EPSILON)
 
-    silence_rms = rms_array[silence_mask]
-    speech_rms = rms_array[speech_mask]
-    speech_fraction = float(np.sum(speech_mask)) / total_frames
+        # Clipping in this window.
+        clipping_detected = bool(np.any(window_peak >= _CLIPPING_THRESHOLD_LINEAR))
+
+        results.append(_SlidingWindowResult(
+            start_frame=start_frame,
+            end_frame=end_frame,
+            start_sample=start_sample,
+            end_sample=end_sample,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            snr_db=snr_db,
+            noise_cv=noise_cv,
+            speech_fraction=speech_fraction,
+            clipping_detected=clipping_detected,
+        ))
 
     logger.debug(
-        "VAD: %d total | %d speech | %d silence | %d ambiguous | "
-        "speech fraction: %.2f",
-        total_frames, len(speech_rms), len(silence_rms),
-        total_frames - len(speech_rms) - len(silence_rms),
-        speech_fraction,
+        "Computed %d sliding window SNR values (%.0fs window, %.0fs hop)",
+        len(results),
+        _SLIDING_WINDOW_SECONDS,
+        _SLIDING_HOP_SECONDS,
     )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# File-level SNR and stability aggregation
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_file_level_snr(
+    rms_array: np.ndarray,
+    silence_threshold: float,
+    speech_threshold: float,
+) -> tuple[float | None, float | None, bool, str | None]:
+    """
+    Compute file-level SNR and noise stability from the full RMS array.
+
+    Used to populate the file_level block in the output JSON. The sliding
+    window series gives time-indexed precision; this gives an overall summary.
+
+    Returns
+    -------
+    tuple[float|None, float|None, bool, str|None]
+        (snr_db, noise_cv, noise_is_unstable, note)
+    """
+    silence_rms = rms_array[rms_array <= silence_threshold]
+    speech_rms = rms_array[rms_array >= speech_threshold]
 
     if len(silence_rms) < _MIN_SILENCE_FRAMES:
         note = (
-            f"Only {len(silence_rms)} silence frame(s) found "
-            f"(minimum: {_MIN_SILENCE_FRAMES}). "
-            "Audio may be continuous speech — SNR estimate unreliable."
+            f"Only {len(silence_rms)} silence frame(s) — "
+            "audio may be continuous speech. SNR estimate unreliable."
         )
-        logger.warning("SNR skipped: %s", note)
-        return None, speech_fraction, note, energy_percentiles, noise_cv, noise_is_unstable
+        return None, None, False, note
 
     if len(speech_rms) == 0:
-        note = (
-            "No speech frames detected above the energy threshold. "
-            "Audio may be near-silent or contain only background noise."
-        )
-        logger.warning("SNR skipped: %s", note)
-        return None, speech_fraction, note, energy_percentiles, noise_cv, noise_is_unstable
+        note = "No speech frames detected. Audio may be near-silent."
+        return None, None, False, note
 
-    # ------------------------------------------------------------------
-    # Noise floor stationarity check.
-    # Applied after _MIN_SILENCE_FRAMES guard — std() is statistically
-    # meaningless on very small samples.
-    # ------------------------------------------------------------------
-    noise_cv, noise_is_unstable = _check_noise_stability(silence_rms)
+    mean_speech = float(np.mean(speech_rms))
+    mean_silence = float(np.mean(silence_rms))
 
-    mean_speech_rms = float(np.mean(speech_rms))
-    mean_silence_rms = float(np.mean(silence_rms))
+    if mean_silence < _EPSILON:
+        return 60.0, 0.0, False, "Noise floor near zero — SNR capped at 60 dB."
 
-    if mean_silence_rms < _EPSILON:
-        note = (
-            "Noise floor is effectively zero — audio may have been "
-            "pre-processed. SNR capped at 60 dB."
-        )
-        logger.debug(note)
-        return 60.0, speech_fraction, note, energy_percentiles, noise_cv, noise_is_unstable
+    snr_db = float(20.0 * np.log10(mean_speech / mean_silence))
 
-    snr_db = 20.0 * np.log10(mean_speech_rms / mean_silence_rms)
+    # Noise stability.
+    noise_cv = float(np.std(silence_rms) / (mean_silence + _EPSILON))
+    noise_is_unstable = noise_cv > _NOISE_INSTABILITY_THRESHOLD
 
-    # If noise is unstable, append a caveat to the note without
-    # changing the SNR value itself. The raw measurement is preserved.
-    # Phase 4 Fusion uses noise_is_unstable independently.
-    note = None
+    note: str | None = None
     if noise_is_unstable:
         note = (
-            f"Noise floor is non-stationary (CV={noise_cv:.3f} > "
-            f"{_NOISE_INSTABILITY_THRESHOLD}). SNR of {snr_db:.1f} dB "
-            "may be over-optimistic — background environment is chaotic. "
-            "Phase 4 Fusion should weight this file's confidence scores down."
+            f"Non-stationary noise floor (CV={noise_cv:.3f} > "
+            f"{_NOISE_INSTABILITY_THRESHOLD}). "
+            f"SNR of {snr_db:.1f} dB may be over-optimistic. "
+            "See quality_events for time-indexed degraded zones."
         )
 
-    logger.debug(
-        "SNR: %.1f dB (speech RMS: %.6f, noise RMS: %.6f, noise CV: %s)",
-        snr_db, mean_speech_rms, mean_silence_rms,
-        f"{noise_cv:.3f}" if noise_cv is not None else "n/a",
-    )
-
-    return float(snr_db), speech_fraction, note, energy_percentiles, noise_cv, noise_is_unstable
-
-
-# ---------------------------------------------------------------------------
-# SNR classification
-# ---------------------------------------------------------------------------
+    return snr_db, noise_cv, noise_is_unstable, note
 
 
 def _classify_snr(snr_db: float | None) -> tuple[str, bool]:
-    """
-    Map SNR to classification label and flag status.
-
-    Parameters
-    ----------
-    snr_db : float | None
-        Estimated SNR in dB. None when SNR could not be computed.
-
-    Returns
-    -------
-    tuple[str, bool]
-        (classification_label, snr_flagged)
-    """
+    """Map SNR to classification label and flag status."""
     if snr_db is None:
         return "UNKNOWN", True
-
     for min_snr, label, flagged in _SNR_THRESHOLDS:
         if snr_db >= min_snr:
             return label, flagged
-
     return "UNKNOWN", True
 
 
@@ -568,39 +511,28 @@ def run_stage2(
     """
     Execute Stage 2: Audio Quality Profiling.
 
-    Single soundfile.blocks() streaming pass through the working audio.
-    Clipping detection and SNR estimation both derive from the same
-    frame-by-frame read — the file is never read twice.
+    Two-pass approach:
+        Pass 1 (I/O):        Stream the working WAV frame-by-frame via
+                             soundfile.blocks(). Collect rms_per_frame
+                             and peak_per_frame arrays.
+        Pass 2 (Computation): Compute sliding window SNR series, build
+                             30s quality windows, detect quality events.
+                             No second file read.
+
+    All time-referenced measurements carry sample offsets (original
+    sample space) as primary Signal Time keys.
 
     Parameters
     ----------
     stage1_result : Stage1Result
-        Complete output from run_stage1(). Provides original audio
-        properties (sample rate, channels, duration) without re-probing.
+        Complete output from run_stage1().
     working_audio_path : Path
-        Path to the working PCM WAV produced by extract_working_audio().
-        May be the original file (for native soundfile formats) or the
-        extracted WAV (for video containers and compressed audio).
+        Working PCM WAV produced by extract_working_audio().
 
     Returns
     -------
     Stage2Result
         Complete Stage 2 profiling results. Pass to run_stage3().
-
-    Examples
-    --------
-    >>> from src.utils.audio import run_stage1, run_stage2
-    >>> from src.utils.audio.extraction import extract_working_audio
-    >>>
-    >>> s1 = run_stage1(Path("footage/incident_001.mp4"))
-    >>> working_path, _, _ = extract_working_audio(
-    ...     s1.original_path, Path("data"), "incident_001"
-    ... )
-    >>> s2 = run_stage2(s1, working_path)
-    >>> s2.audio_quality.snr_db
-    18.4
-    >>> s2.audio_quality.snr_classification
-    'MODERATE'
     """
     from .stage1 import Stage1Result  # Avoid circular import.
 
@@ -608,89 +540,161 @@ def run_stage2(
     props = stage1_result.audio_properties
 
     logger.info("Stage 2 — Audio Quality Profiling: %s", path.name)
-    logger.debug("Working audio: %s", working_audio_path)
+    logger.debug(
+        "Working audio: %s | original SR: %d Hz",
+        working_audio_path, props.sample_rate,
+    )
+
+    # Instantiate EventDetector with the scale factor for this file.
+    detector = EventDetector(
+        original_sample_rate=props.sample_rate,
+        analysis_sample_rate=_ANALYSIS_SAMPLE_RATE,
+        frame_samples=_FRAME_SAMPLES,
+    )
 
     # ------------------------------------------------------------------
-    # Step 1: Source basic properties from Stage 1 — no re-probe needed.
+    # Pass 1: Stream the working WAV, collect per-frame arrays.
     # ------------------------------------------------------------------
-    duration_seconds = props.duration_seconds
-    sample_rate_original = props.sample_rate
-    channels_original = props.channels
-
-    # ------------------------------------------------------------------
-    # Step 2: Single soundfile.blocks() streaming pass.
-    # Collects per-frame RMS values and peak amplitude in one read.
-    # ------------------------------------------------------------------
-    stream_result = _stream_frame_rms(working_audio_path, sample_rate_original)
+    stream_result = _stream_frame_arrays(working_audio_path, props.sample_rate)
 
     if stream_result is None:
         logger.warning(
             "Streaming pass failed for %s — "
-            "clipping and SNR measurements unavailable.",
+            "all quality measurements unavailable.",
             path.name,
         )
-        clipping_detected = False
-        peak_dbfs = None
-        snr_db = None
-        speech_fraction = None
-        snr_note = "Waveform streaming failed — measurements unavailable."
-        energy_percentiles: dict[str, float] = {}
-        noise_cv: float | None = None
-        noise_is_unstable: bool = False
+        audio_quality = AudioQualityProfile(
+            duration_seconds=props.duration_seconds,
+            sample_rate_original=props.sample_rate,
+            channels_original=props.channels,
+            clipping_detected=False,
+            clipping_peak_dbfs=None,
+            snr_db=None,
+            snr_classification="UNKNOWN",
+            snr_flagged=True,
+            noise_stability_cv=None,
+            noise_is_unstable=False,
+            vad_speech_fraction=None,
+            quality_windows=[],
+            quality_events=[],
+            vad_energy_percentiles={},
+            snr_note="Waveform streaming failed — measurements unavailable.",
+        )
+        return Stage2Result(audio_quality=audio_quality)
+
+    rms_array, peak_array = stream_result
+    n_frames = len(rms_array)
+
+    # ------------------------------------------------------------------
+    # Signal Time integrity check — drift detection.
+    # Compare actual frames processed against the expected total_samples
+    # from Stage 1 ffprobe. A discrepancy beyond one frame's worth of
+    # samples indicates timestamp drift or a truncated/corrupt file.
+    # ------------------------------------------------------------------
+    actual_samples_processed = n_frames * _FRAME_SAMPLES
+    expected_samples = props.total_samples
+    sample_tolerance = _FRAME_SAMPLES  # one frame of acceptable rounding
+
+    if (
+        expected_samples > 0
+        and abs(actual_samples_processed - expected_samples) > sample_tolerance
+    ):
+        logger.warning(
+            "Signal Time drift detected for %s: "
+            "processed %d samples, expected %d samples (delta: %d). "
+            "File may be truncated or corrupt. "
+            "Quality window timestamps may not align with the full recording.",
+            path.name,
+            actual_samples_processed,
+            expected_samples,
+            actual_samples_processed - expected_samples,
+        )
     else:
-        rms_values, peak_linear = stream_result
-
-        # ------------------------------------------------------------------
-        # Step 3: Clipping detection from peak amplitude.
-        # ------------------------------------------------------------------
-        clipping_detected, peak_dbfs = _detect_clipping(peak_linear)
-
-        # ------------------------------------------------------------------
-        # Step 4: SNR estimation from RMS histogram.
-        # ------------------------------------------------------------------
-        snr_db, speech_fraction, snr_note, energy_percentiles, noise_cv, noise_is_unstable = (
-            _estimate_snr(rms_values)
+        logger.debug(
+            "Signal Time integrity check passed: "
+            "processed %d samples, expected %d (delta: %d).",
+            actual_samples_processed,
+            expected_samples,
+            actual_samples_processed - expected_samples,
         )
 
     # ------------------------------------------------------------------
-    # Step 5: Classify SNR.
+    # Pass 2: All computation from the in-memory arrays.
     # ------------------------------------------------------------------
+
+    # Clipping detection — file-level.
+    clipping_detected, peak_dbfs = _detect_clipping(peak_array)
+
+    # Global VAD thresholds from full-file RMS distribution.
+    silence_threshold, speech_threshold, speech_fraction = (
+        _compute_vad_thresholds(rms_array)
+    )
+
+    # Energy percentile summary for output metadata.
+    pct_keys = [10, 20, 50, 80, 90]
+    energy_percentiles = {
+        f"p{p}": float(np.percentile(rms_array, p))
+        for p in pct_keys
+    }
+
+    # File-level SNR and stability.
+    snr_db, noise_cv, noise_is_unstable, snr_note = _aggregate_file_level_snr(
+        rms_array, silence_threshold, speech_threshold,
+    )
     snr_classification, snr_flagged = _classify_snr(snr_db)
 
     if snr_flagged and snr_db is not None:
         logger.warning(
-            "Low SNR: %.1f dB (%s) — diarization reliability may be "
-            "reduced for %s.",
+            "Low SNR: %.1f dB (%s) for %s.",
             snr_db, snr_classification, path.name,
         )
 
+    # Sliding window SNR series — Signal Time anchored.
+    sliding_results = _compute_sliding_window_snrs(
+        rms_array, peak_array,
+        silence_threshold, speech_threshold,
+        detector,
+    )
+
+    # 30-second quality windows — Signal Time anchored.
+    quality_windows = detector.build_quality_windows(
+        rms_array, peak_array,
+        silence_threshold, speech_threshold,
+    )
+
+    # Quality events — contiguous degraded zones, Signal Time anchored.
+    quality_events = detector.detect_quality_events(sliding_results)
+
     # ------------------------------------------------------------------
-    # Step 6: Assemble result.
+    # Assemble result.
     # ------------------------------------------------------------------
     audio_quality = AudioQualityProfile(
-        duration_seconds=duration_seconds,
-        sample_rate_original=sample_rate_original,
-        channels_original=channels_original,
+        duration_seconds=props.duration_seconds,
+        sample_rate_original=props.sample_rate,
+        channels_original=props.channels,
         clipping_detected=clipping_detected,
         clipping_peak_dbfs=peak_dbfs,
         snr_db=snr_db,
         snr_classification=snr_classification,
         snr_flagged=snr_flagged,
-        vad_speech_fraction=speech_fraction,
-        vad_energy_percentiles=energy_percentiles,
         noise_stability_cv=noise_cv,
         noise_is_unstable=noise_is_unstable,
+        vad_speech_fraction=speech_fraction,
+        quality_windows=quality_windows,
+        quality_events=quality_events,
+        vad_energy_percentiles=energy_percentiles,
         snr_note=snr_note,
     )
 
-    result = Stage2Result(audio_quality=audio_quality)
-
     logger.info(
-        "Stage 2 complete — SNR: %s (%s) | clipping: %s | speech: %s",
+        "Stage 2 complete — SNR: %s (%s) | noise_unstable: %s | "
+        "clipping: %s | windows: %d | events: %d",
         f"{snr_db:.1f} dB" if snr_db is not None else "unknown",
         snr_classification,
+        noise_is_unstable,
         clipping_detected,
-        f"{speech_fraction:.0%}" if speech_fraction is not None else "unknown",
+        len(quality_windows),
+        len(quality_events),
     )
 
-    return result
+    return Stage2Result(audio_quality=audio_quality)
