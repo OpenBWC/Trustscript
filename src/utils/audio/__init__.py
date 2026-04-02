@@ -56,7 +56,7 @@ from .models import (
     QualityWindow,
     Stage2Result,
 )
-from .stage2 import run_stage2
+from .profiling import run_stage2 
 from .stage1 import (
     ALL_SUPPORTED_FORMATS,
     PassthroughDecision,
