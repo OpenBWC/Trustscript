@@ -213,11 +213,22 @@ def probe_audio_properties(path: Path) -> AudioProperties:
     raw_bit_rate = audio_stream.get("bit_rate")
     bit_rate = int(raw_bit_rate) if raw_bit_rate is not None else None
 
+    sample_rate = int(audio_stream.get("sample_rate", 0))
+
+    # total_samples is the global Signal Time checksum for this file.
+    # Computed from duration × sample_rate rather than nb_samples because
+    # nb_samples requires a full decode pass for compressed codecs (AAC,
+    # MP3) and is not reliably present in ffprobe stream metadata.
+    # The Stage 2 streaming pass compares its actual frame count against
+    # this value to detect drift or truncation.
+    total_samples = round(duration * sample_rate) if sample_rate > 0 else 0
+
     properties = AudioProperties(
-        sample_rate=int(audio_stream.get("sample_rate", 0)),
+        sample_rate=sample_rate,
         channels=int(audio_stream.get("channels", 0)),
         codec_name=audio_stream.get("codec_name", "unknown"),
         duration_seconds=duration,
+        total_samples=total_samples,
         bit_rate=bit_rate,
     )
 
