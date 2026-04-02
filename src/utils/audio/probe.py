@@ -233,12 +233,13 @@ def probe_audio_properties(path: Path) -> AudioProperties:
     )
 
     logger.debug(
-        "Probed %s: %dHz, %dch, codec=%s, duration=%.1fs",
+        "Probed %s: %dHz, %dch, codec=%s, duration=%.1fs, total_samples=%d",
         path.name,
         properties.sample_rate,
         properties.channels,
         properties.codec_name,
         properties.duration_seconds,
+        properties.total_samples,
     )
 
     return properties
