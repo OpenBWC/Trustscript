@@ -58,6 +58,16 @@ class AudioProperties:
         Audio codec as reported by ffprobe.
     duration_seconds : float
         Total duration of the audio stream in seconds.
+    total_samples : int
+        Expected total sample count: round(duration_seconds * sample_rate).
+        Serves as a global checksum for Signal Time integrity. After
+        Stage 2's streaming pass, the actual frame count (n_frames *
+        FRAME_SAMPLES) should match this value within one frame's worth
+        of samples. A meaningful discrepancy indicates timestamp drift
+        or a corrupt/truncated file and should be logged as a warning.
+        Computed from ffprobe duration × sample_rate rather than reading
+        nb_samples directly, which requires a full decode pass for
+        compressed codecs (AAC, MP3) and is not reliably available.
     bit_rate : int | None
         Audio bit rate in bits per second. None when unavailable.
     """
@@ -65,6 +75,7 @@ class AudioProperties:
     channels: int
     codec_name: str
     duration_seconds: float
+    total_samples: int = 0
     bit_rate: int | None = None
 
 
