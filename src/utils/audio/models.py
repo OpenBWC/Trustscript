@@ -147,6 +147,16 @@ class QualityWindow:
         Fraction of frames classified as speech in this window.
     clipping_detected : bool
         True if any frame in this window exceeded -1 dBFS.
+    flags : list[str]
+        Quality flags raised during analysis of this window.
+        Populated by build_quality_windows() in events.py.
+        Possible values:
+            UNSTABLE_NOISE   noise_stability_cv > NOISE_INSTABILITY_THRESHOLD.
+                             The local SNR for this window may be
+                             over-optimistic — the noise floor is chaotic.
+            LOW_SNR          snr_db < POOR threshold (< 10 dB).
+            CLIPPING         Peak amplitude >= -1 dBFS detected.
+        Multiple flags may be set simultaneously on a single window.
     """
     start_sample: int
     end_sample: int
@@ -159,6 +169,7 @@ class QualityWindow:
     noise_is_unstable: bool
     speech_fraction: float | None
     clipping_detected: bool
+    flags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -179,6 +190,7 @@ class QualityWindow:
                 if self.speech_fraction is not None else None
             ),
             "clipping_detected": self.clipping_detected,
+            "flags": self.flags,
         }
 
 
@@ -231,6 +243,21 @@ class QualityEvent:
     note : str
         Human-readable description of the event and its forensic
         implications for diarization reliability.
+
+        For COMBINED events (where multiple quality problems co-occur),
+        the note carries the full explanatory weight — it enumerates each
+        active problem type with its measured value so a reviewer
+        understands the intersection without needing to cross-reference
+        other fields. COMBINED events intentionally have only one
+        snr_classification (derived from mean SNR) rather than per-problem
+        classifications, because the note is the definitive record of what
+        was happening acoustically in this zone.
+
+        Example for a COMBINED event:
+            "Multiple quality problems co-occurring (30.0s): low SNR
+            (7.8 dB), unstable noise floor (CV=0.710). This region has
+            severely reduced diarization reliability. Phase 4 Fusion
+            should weight all segments in this zone down."
     """
     event_type: str
     start_sample: int
