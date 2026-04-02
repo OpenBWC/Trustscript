@@ -15,7 +15,7 @@ Convert per-window quality measurements into two structured outputs:
                          windows into intervals.
 
 This module does no audio I/O. It operates entirely on arrays of
-per-frame measurements produced by profiling/ streaming pass.
+per-frame measurements produced by profiling.py's streaming pass.
 
 Signal Time contract
 --------------------
@@ -270,6 +270,20 @@ class EventDetector:
             window_rms = rms_per_frame[window_start:window_end]
             window_peak = peak_per_frame[window_start:window_end]
 
+            # Guard: skip tail slivers below MIN_WINDOW_FRAMES.
+            # A file whose duration is not an exact multiple of 30s will
+            # produce a final window with only a few seconds of audio.
+            # Percentile-based VAD on < 100 frames produces unreliable
+            # thresholds and misleading SNR values — better to skip it
+            # than to emit a low-confidence measurement without a caveat.
+            if len(window_rms) < MIN_WINDOW_FRAMES:
+                logger.debug(
+                    "Skipping tail quality window at frame %d: "
+                    "only %d frames (minimum: %d).",
+                    window_start, len(window_rms), MIN_WINDOW_FRAMES,
+                )
+                continue
+
             # Signal Time anchors for this window.
             start_sample = self.frame_to_original_sample(window_start)
             end_sample = self.frame_to_original_sample(window_end)
@@ -316,6 +330,18 @@ class EventDetector:
             # Clipping: any frame peak in this window above threshold.
             clipping_detected = bool(np.any(window_peak >= CLIPPING_THRESHOLD_LINEAR))
 
+            # Build flags list for this window.
+            # Flags provide a clear audit trail for why SNR may fluctuate
+            # across windows — a reviewer can see UNSTABLE_NOISE on a
+            # specific window rather than inferring it from the CV value.
+            window_flags: list[str] = []
+            if noise_is_unstable:
+                window_flags.append("UNSTABLE_NOISE")
+            if snr_db is not None and snr_db < 10.0:  # POOR threshold
+                window_flags.append("LOW_SNR")
+            if clipping_detected:
+                window_flags.append("CLIPPING")
+
             windows.append(QualityWindow(
                 start_sample=start_sample,
                 end_sample=end_sample,
@@ -328,6 +354,7 @@ class EventDetector:
                 noise_is_unstable=noise_is_unstable,
                 speech_fraction=speech_fraction,
                 clipping_detected=clipping_detected,
+                flags=window_flags,
             ))
 
         logger.debug(
