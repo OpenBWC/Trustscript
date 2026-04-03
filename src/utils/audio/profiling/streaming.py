@@ -53,7 +53,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from .constants import FRAME_SAMPLES
+from .constants import FRAME_DURATION_MS,
 
 logger = logging.getLogger(__name__)
 
@@ -61,39 +61,30 @@ logger = logging.getLogger(__name__)
 def stream_frame_arrays(
     working_audio_path: Path,
     original_sample_rate: int,
+    frame_samples: int,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """
     Stream the working WAV via soundfile.blocks() and return per-frame
     RMS and peak amplitude arrays.
 
-    Both arrays are indexed by frame number. Frame ``i`` corresponds to
-    Signal Time:
-
-    .. code-block:: python
-
-        analysis_sample  = i * FRAME_SAMPLES
-        original_sample  = round(analysis_sample * (original_sr / 16000))
-        seconds          = original_sample / original_sr
-
-    This conversion is performed by ``EventDetector.frame_to_original_sample()``
-    in events.py — not here. This module only collects the raw arrays.
-
     Parameters
     ----------
     working_audio_path : Path
-        Working PCM f32le WAV produced by extraction.py. Must be a
-        format soundfile can read natively (WAV, FLAC).
+        Working PCM f32le WAV produced by extraction.py.
     original_sample_rate : int
         Original sample rate from Stage 1 AudioProperties.
-        Used only for debug logging — not for computation.
+        Used for debug logging only.
+    frame_samples : int
+        Number of samples per frame, computed dynamically in stage2.py
+        as ``int(sample_rate * FRAME_DURATION_MS / 1000.0)``.
+        Must reflect the ACTUAL sample rate of the working file, not
+        the 16kHz analysis constant — using FRAME_SAMPLES directly
+        here would cause a time-stretch bug on non-16kHz files.
 
     Returns
     -------
     tuple[np.ndarray, np.ndarray] | None
-        ``(rms_per_frame, peak_per_frame)`` as float32 arrays of shape
-        ``(n_frames,)``. Returns ``None`` if soundfile fails to open or
-        read the file — callers handle this gracefully since quality
-        profiling failure is non-fatal for the pipeline.
+        ``(rms_per_frame, peak_per_frame)`` or ``None`` on failure.
     """
     rms_list: list[float] = []
     peak_list: list[float] = []
@@ -101,7 +92,7 @@ def stream_frame_arrays(
     try:
         for block in sf.blocks(
             working_audio_path,
-            blocksize=FRAME_SAMPLES,
+            blocksize=frame_samples,
             overlap=0,
             dtype="float32",
         ):
@@ -147,7 +138,7 @@ def stream_frame_arrays(
         "Streamed %s: %d frames (%.1f seconds at original rate)",
         working_audio_path.name,
         len(rms_list),
-        len(rms_list) * FRAME_SAMPLES / 16_000,
+        len(rms_list) * frame_samples / original_sample_rate,
     )
 
     return rms_array, peak_array
