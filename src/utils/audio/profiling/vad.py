@@ -54,6 +54,40 @@ from .constants import (
 logger = logging.getLogger(__name__)
 
 
+def compute_energy_summary(rms_array: np.ndarray) -> dict[str, float]:
+    """
+    Compute a percentile summary of the full-file RMS energy distribution.
+
+    This is the "receipt" that proves why the SNR was classified as it
+    was. By recording the p10/p20/p50/p80/p90 RMS values, a reviewer
+    can inspect the raw energy distribution that drove the speech/silence
+    classification rather than trusting the SNR number alone.
+
+    Parameters
+    ----------
+    rms_array : np.ndarray
+        Per-frame RMS values for the full file, from streaming.py.
+
+    Returns
+    -------
+    dict[str, float]
+        Keys: p10, p20, p50, p80, p90.
+        Values: RMS amplitude at each percentile.
+        Empty dict if the array is too short for meaningful percentiles.
+    """
+    if len(rms_array) < 10:
+        logger.debug(
+            "RMS array too short (%d frames) for energy summary.",
+            len(rms_array),
+        )
+        return {}
+
+    return {
+        f"p{p}": float(np.percentile(rms_array, p))
+        for p in [10, 20, 50, 80, 90]
+    }
+
+
 def compute_vad_thresholds(
     rms_array: np.ndarray,
 ) -> tuple[float, float, float | None]:

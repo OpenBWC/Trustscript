@@ -85,7 +85,7 @@ def run_stage2(
     Stage2Result
         Complete Stage 2 profiling results. Pass to ``run_stage3()``.
     """
-    from .stage1 import Stage1Result  # Avoid circular import at module load.
+    from ..stage1 import Stage1Result  # Avoid circular import at module load.
 
     path = stage1_result.original_path
     props = stage1_result.audio_properties
@@ -268,7 +268,7 @@ def _build_unavailable_result(props: "AudioProperties") -> Stage2Result:  # type
     Build a Stage2Result with all measurements set to unavailable.
     Used when the streaming pass fails entirely.
     """
-    from .models import AudioQualityProfile, Stage2Result
+    from ..models import AudioQualityProfile, Stage2Result
 
     audio_quality = AudioQualityProfile(
         duration_seconds=props.duration_seconds,
