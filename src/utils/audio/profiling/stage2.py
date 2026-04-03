@@ -42,14 +42,12 @@ Contributors
 import logging
 from pathlib import Path
 
-import numpy as np
-
-from .constants import FRAME_SAMPLES, QUALITY_WINDOW_SECONDS
+from .constants import ANALYSIS_SAMPLE_RATE, FRAME_SAMPLES, QUALITY_WINDOW_SECONDS
 from .events import EventDetector
 from ..models import AudioQualityProfile, Stage2Result
 from .snr import classify_snr, compute_file_level_snr, compute_sliding_window_snrs
 from .streaming import stream_frame_arrays
-from .vad import compute_vad_thresholds, detect_clipping
+from .vad import compute_energy_summary, compute_vad_thresholds, detect_clipping
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +98,7 @@ def run_stage2(
     # Holds the integer conversion: analysis frame → original sample offset.
     detector = EventDetector(
         original_sample_rate=props.sample_rate,
-        analysis_sample_rate=16_000,
+        analysis_sample_rate=ANALYSIS_SAMPLE_RATE,
         frame_samples=FRAME_SAMPLES,
     )
 
@@ -140,11 +138,8 @@ def run_stage2(
     # Clipping detection.
     clipping_detected, peak_dbfs = detect_clipping(peak_array)
 
-    # Energy percentile summary for output metadata.
-    energy_percentiles = {
-        f"p{p}": float(np.percentile(rms_array, p))
-        for p in [10, 20, 50, 80, 90]
-    }
+    # Energy percentile summary — the "receipt" for SNR classification.
+    energy_percentiles = compute_energy_summary(rms_array)
 
     # File-level SNR and noise stability.
     snr_db, noise_cv, noise_is_unstable, snr_note = compute_file_level_snr(
