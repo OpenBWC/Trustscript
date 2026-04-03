@@ -345,6 +345,30 @@ def _run_diarize_pipeline(
         )
 
     # ------------------------------------------------------------------
+    # Audio Extraction (between Stage 1 and Stage 2)
+    # Status:  IMPLEMENTED
+    # File:    src/utils/audio/extraction.py
+    # Produces a working PCM WAV from the original file so that
+    # soundfile can be used for all subsequent audio reads.
+    # ------------------------------------------------------------------
+    log.info("Audio Extraction — producing working WAV")
+
+    from src.utils.audio.extraction import extract_working_audio
+
+    working_audio_path, was_extracted, working_sha256 = extract_working_audio(
+        original_path=stage1_result.original_path,
+        output_dir=output_dir,
+        incident_id=incident_id,
+    )
+
+    if verbose:
+        console.print(
+            f"  [dim]working audio:[/dim]  {working_audio_path.name}\n"
+            f"  [dim]extracted:[/dim]      {was_extracted}\n"
+            f"  [dim]working SHA256:[/dim] {working_sha256[:16]}..."
+        )
+
+    # ------------------------------------------------------------------
     # Stage 2 — Audio Quality Profiling
     # Status:  IMPLEMENTED
     # File:    src/utils/audio/profiling.py
@@ -353,7 +377,7 @@ def _run_diarize_pipeline(
 
     from src.utils.audio import run_stage2
 
-    stage2_result = run_stage2(stage1_result)
+    stage2_result = run_stage2(stage1_result, working_audio_path)
 
     if verbose:
         aq = stage2_result.audio_quality
