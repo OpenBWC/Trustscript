@@ -53,7 +53,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from .constants import FRAME_DURATION_MS,
+from .constants import FRAME_DURATION_MS
 
 logger = logging.getLogger(__name__)
 
