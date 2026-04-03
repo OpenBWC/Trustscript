@@ -64,6 +64,7 @@ from .constants import (
     SILENCE_PERCENTILE,
     SPEECH_PERCENTILE,
     CLIPPING_THRESHOLD_LINEAR,
+    MIN_WINDOW_FRAMES
 )
 from ..models import QualityEvent, QualityWindow
 

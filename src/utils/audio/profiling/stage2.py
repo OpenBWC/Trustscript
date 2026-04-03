@@ -42,7 +42,7 @@ Contributors
 import logging
 from pathlib import Path
 
-from .constants import ANALYSIS_SAMPLE_RATE, FRAME_SAMPLES, QUALITY_WINDOW_SECONDS
+from .constants import ANALYSIS_SAMPLE_RATE, FRAME_DURATION_MS, FRAME_SAMPLES, QUALITY_WINDOW_SECONDS
 from .events import EventDetector
 from ..models import AudioQualityProfile, Stage2Result
 from .snr import classify_snr, compute_file_level_snr, compute_sliding_window_snrs
@@ -96,16 +96,48 @@ def run_stage2(
 
     # Instantiate EventDetector with the scale factor for this file.
     # Holds the integer conversion: analysis frame → original sample offset.
+    # ------------------------------------------------------------------
+    # Dynamic frame size — CRITICAL for Signal Time correctness.
+    #
+    # The working WAV is at the ORIGINAL sample rate (e.g. 44.1kHz),
+    # not the analysis rate (16kHz). FRAME_SAMPLES is hardcoded for
+    # 16kHz (320 samples = 20ms). Using it on a 44.1kHz file would
+    # read 320-sample blocks that represent only 7.2ms each, causing
+    # a 2.756x time-stretch across the entire quality profile.
+    #
+    # The fix: compute frame size dynamically from the actual sample
+    # rate reported by ffprobe in Stage 1.
+    #
+    #   44.1kHz: 44100 * 0.020 = 882 samples per 20ms frame (correct)
+    #   16.0kHz: 16000 * 0.020 = 320 samples per 20ms frame (same as const)
+    #
+    # EventDetector.analysis_sample_rate is also set to props.sample_rate
+    # so the scale factor (original_sr / analysis_sr) = 1.0 — frame
+    # indices map directly to original sample offsets with no conversion.
+    # ------------------------------------------------------------------
+    dynamic_frame_samples = int(props.sample_rate * FRAME_DURATION_MS / 1000.0)
+
+    logger.debug(
+        "Dynamic frame size: %d samples at %d Hz = %.0f ms per frame",
+        dynamic_frame_samples,
+        props.sample_rate,
+        dynamic_frame_samples / props.sample_rate * 1000,
+    )
+
     detector = EventDetector(
         original_sample_rate=props.sample_rate,
-        analysis_sample_rate=ANALYSIS_SAMPLE_RATE,
-        frame_samples=FRAME_SAMPLES,
+        analysis_sample_rate=props.sample_rate,   # raw file, not yet 16kHz
+        frame_samples=dynamic_frame_samples,
     )
 
     # ------------------------------------------------------------------
     # Pass 1 (I/O): Stream the working WAV, collect per-frame arrays.
     # ------------------------------------------------------------------
-    stream_result = stream_frame_arrays(working_audio_path, props.sample_rate)
+    stream_result = stream_frame_arrays(
+        working_audio_path,
+        props.sample_rate,
+        dynamic_frame_samples,
+    )
 
     if stream_result is None:
         logger.warning(
@@ -123,7 +155,7 @@ def run_stage2(
     # A discrepancy beyond one frame indicates truncation or corruption.
     # ------------------------------------------------------------------
     _check_signal_time_integrity(
-        path.name, n_frames, props.total_samples
+        path.name, n_frames, props.total_samples, dynamic_frame_samples
     )
 
     # ------------------------------------------------------------------
@@ -213,17 +245,16 @@ def _check_signal_time_integrity(
     filename: str,
     n_frames: int,
     expected_total_samples: int,
+    frame_samples: int,
 ) -> None:
     """
     Compare actual frames processed against Stage 1 total_samples.
 
-    Logs a WARNING if the discrepancy exceeds one frame's tolerance.
-    A meaningful discrepancy indicates the file was truncated, the
-    duration reported by ffprobe was inaccurate, or the streaming
-    pass missed frames.
+    Uses the dynamic frame_samples (not the 16kHz constant) so the
+    check reflects the actual sample rate of the working file.
     """
-    actual_samples = n_frames * FRAME_SAMPLES
-    tolerance = FRAME_SAMPLES * _DRIFT_TOLERANCE_FRAMES
+    actual_samples = n_frames * frame_samples
+    tolerance = frame_samples  # one frame of acceptable rounding
 
     if expected_total_samples <= 0:
         logger.debug(
