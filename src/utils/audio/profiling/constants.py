@@ -76,6 +76,15 @@ SPEECH_PERCENTILE: float = 50.0
 #: CV-based stationarity checks produce noise rather than signal.
 MIN_SILENCE_FRAMES: int = 10
 
+#: Minimum number of frames required before VAD percentile computation
+#: is considered statistically meaningful. A 30-second quality window
+#: at the tail of a file may contain only 2 seconds of audio — below
+#: this threshold, percentile-based thresholds are unreliable and the
+#: window is skipped rather than producing a misleading SNR estimate.
+#: Similarly, a 5-second sliding window sliver at EOF is discarded.
+#: Expressed in frames: 2s / 20ms = 100 frames.
+MIN_WINDOW_FRAMES: int = 100  # 2 seconds at 20ms per frame
+
 
 # ---------------------------------------------------------------------------
 # Noise stationarity

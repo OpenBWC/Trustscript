@@ -65,7 +65,7 @@ from .constants import (
     SPEECH_PERCENTILE,
     CLIPPING_THRESHOLD_LINEAR,
 )
-from .models import QualityEvent, QualityWindow
+from ..models import QualityEvent, QualityWindow
 
 logger = logging.getLogger(__name__)
 

@@ -46,7 +46,7 @@ import numpy as np
 
 from .constants import FRAME_SAMPLES, QUALITY_WINDOW_SECONDS
 from .events import EventDetector
-from .models import AudioQualityProfile, Stage2Result
+from ..models import AudioQualityProfile, Stage2Result
 from .snr import classify_snr, compute_file_level_snr, compute_sliding_window_snrs
 from .streaming import stream_frame_arrays
 from .vad import compute_vad_thresholds, detect_clipping
