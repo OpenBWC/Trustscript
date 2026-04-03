@@ -1,0 +1,26 @@
+# ==============================================================================
+# TrustScript Phase 1 — Diarization (CPU-first)
+# Branch: phase-1/diarization
+# ==============================================================================
+# NOTE: Install torch/torchaudio separately first:
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# ==============================================================================
+
+# --- Diarization Engine ---
+pyannote.audio
+huggingface_hub
+einops
+
+# --- Audio Processing & Chunking ---
+librosa
+soundfile
+pydub
+
+# --- Vault & Re-ID Logic ---
+numpy
+scipy
+
+# --- CLI & Utils ---
+click
+tqdm
+rich
