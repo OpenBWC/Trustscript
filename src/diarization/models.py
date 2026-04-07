@@ -68,8 +68,12 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from pyannote.audio import Inference, Pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +137,8 @@ class Stage4Result:
         True when models were loaded from a local directory (offline
         deployment). False when loaded from HuggingFace cache.
     """
-    pipeline: object
-    embed_inference: object
+    pipeline: "Pipeline"
+    embed_inference: "Inference"
     diarization_model_id: str
     embedding_model_id: str
     loaded_from_local: bool
@@ -223,9 +227,36 @@ def run_stage4(
         )
         embedding_source = str(models_dir / "pyannote-embedding")
         loaded_from_local = True
-        logger.info(
-            "Loading models from local directory: %s", models_dir
-        )
+
+        # Validate local paths exist before calling from_pretrained,
+        # which would produce a cryptic error on a missing directory.
+        # Expected folder names match the git lfs clone instructions
+        # in README.md — Offline Deployment:
+        #   git clone https://hf.co/pyannote/speaker-diarization-community-1 \
+        #       models/pyannote-speaker-diarization-community-1
+        #   git clone https://hf.co/pyannote/embedding \
+        #       models/pyannote-embedding
+        for label, path_str in [
+            ("diarization pipeline", diarization_source),
+            ("embedding model", embedding_source),
+        ]:
+            if not Path(path_str).exists():
+                raise RuntimeError(
+                    f"Local {label} weights not found at: {path_str}\n\n"
+                    "TrustScript expects this exact folder structure "
+                    "under --models-dir:\n"
+                    "  models/\n"
+                    "  ├── pyannote-speaker-diarization-community-1/\n"
+                    "  └── pyannote-embedding/\n\n"
+                    "To download:\n"
+                    "  git lfs install\n"
+                    "  git clone https://hf.co/pyannote/speaker-diarization-community-1 \\\n"
+                    f"      {models_dir}/pyannote-speaker-diarization-community-1\n"
+                    "  git clone https://hf.co/pyannote/embedding \\\n"
+                    f"      {models_dir}/pyannote-embedding\n"
+                )
+
+        logger.info("Loading models from local directory: %s", models_dir)
     else:
         diarization_source = DIARIZATION_MODEL_ID
         embedding_source = EMBEDDING_MODEL_ID
@@ -252,6 +283,11 @@ def run_stage4(
     # Load diarization pipeline.
     # ------------------------------------------------------------------
     logger.info("Loading diarization pipeline: %s", diarization_source)
+    logger.info(
+        "This may take 5–15 seconds on first run. "
+        "pyannote will also download the segmentation-3.0 model internally "
+        "if not already cached — the process is not hung."
+    )
     try:
         pipeline = Pipeline.from_pretrained(
             diarization_source,
