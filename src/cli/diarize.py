@@ -396,15 +396,31 @@ def _run_diarize_pipeline(
 
     # ------------------------------------------------------------------
     # Stage 3 — Normalization
-    # Status:  NOT IMPLEMENTED
-    # File:    src/utils/audio/normalization.py  (to be created)
-    # Note:    Skip this stage when stage1_result.passthrough is True.
+    # Status:  IMPLEMENTED
+    # File:    src/utils/normalization/stage3.py
+    # Skipped automatically when stage1_result.passthrough is True.
     # ------------------------------------------------------------------
     log.info("Stage 3 — Normalization")
-    raise NotImplementedError(
-        "Stage 3 (Normalization) is not yet implemented. "
-        "See Phase 1 spec Stage 3 and src/utils/audio/normalization.py."
-    )
+
+    from src.utils.normalization import run_stage3
+
+    try:
+        stage3_result = run_stage3(
+            stage1_result=stage1_result,
+            working_audio_path=working_audio_path,
+            output_dir=output_dir,
+            incident_id=incident_id,
+        )
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+
+    if verbose:
+        console.print(
+            f"  [dim]normalized:[/dim]    {stage3_result.normalized_path.name}\n"
+            f"  [dim]skipped:[/dim]       {stage3_result.normalization_skipped}\n"
+            f"  [dim]applied:[/dim]       "
+            f"{', '.join(stage3_result.normalization_applied) or 'none'}"
+        )
 
     # ------------------------------------------------------------------
     # Stage 4 — Model Loading
