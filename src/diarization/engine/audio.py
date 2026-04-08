@@ -165,7 +165,21 @@ def extract_segment_embedding(
         512-d float32 embedding, or None if extraction failed.
     """
     frame_start = int(seg_start_local * sample_rate)
-    frame_end = min(int(seg_end_local * sample_rate), chunk_waveform.shape[1])
+    frame_end_raw = int(seg_end_local * sample_rate)
+    frame_end = min(frame_end_raw, chunk_waveform.shape[1])
+
+    if frame_end < frame_end_raw:
+        logger.warning(
+            "extract_segment_embedding: boundary clipped — requested frame %d "
+            "exceeds chunk length %d (%.2fs). Embedding computed on %d fewer "
+            "samples than pyannote intended. Check chunking.py / audio.py "
+            "for sample-rate or duration disagreement. "
+            "Segment: [%.2fs, %.2fs].",
+            frame_end_raw, chunk_waveform.shape[1],
+            (frame_end_raw - chunk_waveform.shape[1]) / sample_rate,
+            frame_end_raw - frame_end,
+            seg_start_local, seg_end_local,
+        )
 
     if frame_end <= frame_start:
         return None
@@ -239,7 +253,16 @@ def compute_rms(
     """
     try:
         frame_start = int(seg_start_local * sample_rate)
-        frame_end = min(int(seg_end_local * sample_rate), chunk_waveform.shape[1])
+        frame_end_raw = int(seg_end_local * sample_rate)
+        frame_end = min(frame_end_raw, chunk_waveform.shape[1])
+        if frame_end < frame_end_raw:
+            logger.warning(
+                "compute_rms: boundary clipped — requested frame %d exceeds "
+                "chunk length %d. RMS computed on truncated window. "
+                "Segment: [%.2fs, %.2fs].",
+                frame_end_raw, chunk_waveform.shape[1],
+                seg_start_local, seg_end_local,
+            )
         if frame_end <= frame_start:
             return None
         seg_waveform = chunk_waveform[:, frame_start:frame_end]
