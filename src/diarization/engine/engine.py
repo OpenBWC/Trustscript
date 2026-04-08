@@ -113,16 +113,16 @@ import numpy as np
 import torch
 import torchaudio
 
-from .models import Stage4Result
-from .segment import (
+from ..models import Stage4Result
+from ..segment import (
     CONCURRENCY_CONFIRMED_THRESHOLD,
     FLAG_CONCURRENT_SPEECH,
     FLAG_GHOST_SPEAKER,
     TimelineSegment,
 )
-from .vault import SpeakerVault
-from .vault.matching import find_best_match
-from .vault.types import MATCH_THRESHOLD
+from ..vault import SpeakerVault
+from ..vault.matching import find_best_match
+from ..vault.types import MATCH_THRESHOLD
 
 if TYPE_CHECKING:
     from pyannote.audio import Inference
