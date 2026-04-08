@@ -47,6 +47,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
+from pyannote.core import Segment as PySegment
 
 if TYPE_CHECKING:
     from pyannote.core import SlidingWindowFeature
@@ -185,10 +186,17 @@ def concurrency_confidence_for_segment(
     -------
     float | None
         Mean per-frame overlap probability in [0, 1], clipped.
-        None if the segment has no frames or any operation fails.
+        None if the segment has no frames, the internal API is
+        unavailable, or any operation fails.
+
+        Fallback contract: downstream phases (Phase 2 triage,
+        stage5.py flag assignment) must treat None as UNKNOWN —
+        neither safe (0.0) nor confirmed (1.0). Concurrency-specific
+        confidence weighting must be bypassed for None segments.
+        Do not substitute a default float; preserve None so the
+        absence of data remains distinguishable from a low score.
     """
     try:
-        from pyannote.core import Segment as PySegment
         seg_obj = PySegment(seg_start_local, seg_end_local)
 
         # mode='loose' includes frames that partially overlap the boundary.
