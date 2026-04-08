@@ -99,8 +99,8 @@ from typing import Any
 import numpy as np
 from scipy.spatial.distance import cosine
 
-from .gates import passes_vault_gate
-from .segment import (
+from ..gates import passes_vault_gate
+from ..segment import (
     AMBIGUITY_MARGIN,
     FLAG_AMBIGUOUS_MATCH,
     FLAG_HIGH_VARIANCE_SPEAKER,
