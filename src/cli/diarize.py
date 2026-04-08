@@ -424,14 +424,27 @@ def _run_diarize_pipeline(
 
     # ------------------------------------------------------------------
     # Stage 4 — Model Loading
-    # Status:  NOT IMPLEMENTED
+    # Status:  IMPLEMENTED
     # File:    src/diarization/models.py
     # ------------------------------------------------------------------
     log.info("Stage 4 — Model Loading")
-    raise NotImplementedError(
-        "Stage 4 (Model Loading) is not yet implemented. "
-        "See Phase 1 spec Stage 4 and src/diarization/models.py."
-    )
+
+    from src.diarization.models import run_stage4
+
+    try:
+        stage4_result = run_stage4(
+            token=token,
+            models_dir=Path(models_dir) if models_dir else None,
+        )
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+
+    if verbose:
+        console.print(
+            f"  [dim]diarization model:[/dim] {stage4_result.diarization_model_id}\n"
+            f"  [dim]embedding model:[/dim]   {stage4_result.embedding_model_id}\n"
+            f"  [dim]local weights:[/dim]     {stage4_result.loaded_from_local}"
+        )
 
     # ------------------------------------------------------------------
     # Stage 5 — Windowed Diarization + Vault Matching
