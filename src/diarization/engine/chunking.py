@@ -58,6 +58,15 @@ def generate_chunk_windows(
     list[tuple[float, float]]
         Ordered list of (chunk_start, chunk_end) in seconds.
     """
+    if chunk_size <= CHUNK_OVERLAP:
+        raise ValueError(
+            f"chunk_size ({chunk_size}s) must be greater than "
+            f"CHUNK_OVERLAP ({CHUNK_OVERLAP}s). "
+            f"At or below this value, chunk start never advances and "
+            f"the window loop will not terminate. "
+            f"Minimum valid chunk_size is {CHUNK_OVERLAP + 1.0}s."
+        )
+
     windows: list[tuple[float, float]] = []
     start = 0.0
     while start < audio_duration:
