@@ -79,13 +79,13 @@ def detect_overlap(
     if overlap_timeline is not None:
         is_overlap = segment_in_overlap(turn, overlap_timeline)
     else:
-        # Fallback: check if any other speaker's turn intersects this one.
-        for other_turn, _, other_speaker in diarization.itertracks(yield_label=True):
-            if other_speaker == local_speaker:
-                continue
-            if other_turn.start < turn.end and other_turn.end > turn.start:
-                is_overlap = True
-                break
+        # Fallback: overlap_timeline unavailable. Use diarization.crop()
+        # to find intersecting tracks — O(log N) via interval tree.
+        intersecting = diarization.crop(turn, mode="intersection")
+        is_overlap = any(
+            speaker != local_speaker
+            for speaker in intersecting.labels()
+        )
 
     overlap_local_labels: list[str] = []
     if is_overlap:
@@ -104,8 +104,8 @@ def segment_in_overlap(
     Test whether a turn intersects any region in the overlap Timeline.
 
     Uses pyannote's Timeline.crop() for fast interval intersection.
-    Returns False on any exception — overlap detection errors are
-    non-fatal; the segment continues to be processed as non-overlap.
+    Returns False on failure, but logs the exception — a silent False
+    would incorrectly assert "no overlap" when the truth is "unknown."
 
     Parameters
     ----------
@@ -120,7 +120,12 @@ def segment_in_overlap(
     """
     try:
         return len(overlap_timeline.crop(turn)) > 0
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "segment_in_overlap: crop failed for turn [%.2fs, %.2fs]: %s — "
+            "returning False (overlap status unknown, not confirmed absent).",
+            turn.start, turn.end, exc,
+        )
         return False
 
 
@@ -132,8 +137,10 @@ def find_coactive_speakers(
     """
     Return local labels of all speakers active during this turn.
 
-    Scans all other tracks in the diarization annotation and returns
-    labels whose turns temporally intersect the given turn.
+    Uses diarization.crop() which is backed by pyannote's internal
+    interval tree — O(log N) per query. The previous O(N) manual
+    iteration over itertracks() compounded to O(N²) across all
+    segments in a chunk and is replaced here.
 
     Parameters
     ----------
@@ -148,13 +155,11 @@ def find_coactive_speakers(
     -------
     list[str]
         Local speaker labels of co-active speakers, deduplicated,
-        in order of first appearance.
+        in order of first appearance in the cropped annotation.
     """
-    coactive: list[str] = []
-    for other_turn, _, other_speaker in diarization.itertracks(yield_label=True):
-        if other_speaker == current_speaker:
-            continue
-        if other_turn.start < turn.end and other_turn.end > turn.start:
-            if other_speaker not in coactive:
-                coactive.append(other_speaker)
-    return coactive
+    intersecting = diarization.crop(turn, mode="intersection")
+    return [
+        speaker
+        for speaker in intersecting.labels()
+        if speaker != current_speaker
+    ]
