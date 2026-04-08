@@ -1,16 +1,17 @@
 """
-src/diarization/vault.py
-=========================
-TrustScript Phase 1 — Stage 5: Speaker Anchor Vault
+src/diarization/vault/vault.py
+================================
+TrustScript Phase 1 — Stage 5: SpeakerVault class.
 
 Responsibility
 --------------
 Maintain global speaker identity across all diarization chunks.
 Answers: "Is the voice in chunk 7 the same person from chunk 2?"
 
-For each discovered speaker, the vault holds a 512-d centroid
-embedding updated incrementally as new clean segments arrive.
-Matching is cosine similarity against all live centroids.
+This module owns state and orchestration only. Pure computations
+(cosine matching, spread metrics, quality block assembly) are
+delegated to matching.py and metrics.py. Data structures live in
+types.py. Gate logic lives in gates.py.
 
 Centroid update correctness
 ----------------------------
@@ -18,82 +19,64 @@ Updates use a true incremental running mean:
 
     new_centroid = (old_centroid * n + embedding) / (n + 1)
 
-A simple (old + new) / 2 is INCORRECT — it halves the weight of
-all prior observations on every merge, progressively losing early
-anchor data. The running mean preserves equal weighting across all
-accepted embeddings regardless of how many have been merged.
+A simple (old + new) / 2 is INCORRECT — it halves the weight of all
+prior observations on every merge. The running mean preserves equal
+weighting across all accepted embeddings regardless of merge count.
 
-Vault gating
+match_or_create() flow — two paths, cleanly separated
+------------------------------------------------------
+Existing anchor (best cosine score >= MATCH_THRESHOLD):
+    1. Check for AMBIGUOUS_MATCH (top-2 scores within 0.05).
+    2. Assign global ID and reid_score.
+    3. Apply confidence flags via apply_reid_flags().
+    4. Run vault gate (is_new_anchor=False).
+    5a. Passes → _update_centroid().
+        Apply PROVISIONAL flag if gate reason="PROVISIONAL".
+    5b. Fails  → _record_rejection(), no centroid write.
+
+New speaker (no match above threshold):
+    1. Allocate speculative ID.
+    2. Assign speaker=speculative_id, reid_score=1.0.
+    3. Run vault gate (is_new_anchor=True, requires candidate_embeddings).
+    4a. Passes → _create_entry().
+        Apply PROVISIONAL flag if gate reason="PROVISIONAL".
+    4b. Fails  → roll back ID, set speaker="UNKNOWN",
+                 reid_score=None, _record_rejection().
+
+_create_entry() and _update_centroid() are the only paths that write
+vault state. Gate outcome is handled inline in each sub-path where
+new-vs-existing context is explicit. This eliminates the double-write
+risk of a shared gate-routing helper.
+
+RMS handling
 ------------
-Every embedding passes through passes_vault_gate() before any write.
-A segment must pass all four gates. Rejected embeddings go to
-rejected_history keyed by rejection reason. They are never discarded —
-Phase 2 can consume them for mixed-signal analysis.
-
-See gates.py for full gate documentation.
-
-match_or_create() flow
------------------------
-The primary vault operation. Two paths, cleanly separated:
-
-  Existing anchor path (best cosine score >= MATCH_THRESHOLD):
-    1. Check ambiguity (top-2 within AMBIGUITY_MARGIN)
-    2. Assign global ID and reid_score
-    3. Apply reid confidence flags
-    4. Run vault gate (is_new_anchor=False)
-    5a. Gate passes → _update_centroid()
-        Apply PROVISIONAL flag if gate returned reason="PROVISIONAL"
-    5b. Gate fails  → _record_rejection(), no centroid write
-
-  New speaker path (no match above threshold):
-    1. Allocate speculative ID
-    2. Assign speaker=speculative_id, reid_score=1.0
-    3. Run vault gate (is_new_anchor=True, requires candidate_embeddings)
-    4a. Gate passes → _create_entry()
-        Apply PROVISIONAL flag if gate returned reason="PROVISIONAL"
-    4b. Gate fails  → roll back ID, set speaker="UNKNOWN",
-                      reid_score=None, _record_rejection()
-
-_create_entry() and _update_centroid() are the only two paths that
-write to vault state. There is no shared gate-routing helper — the
-gate outcome is handled inline in match_or_create() where the
-new-vs-existing context is explicit. This prevents the double-write
-bug that a shared helper would introduce.
+rms is typed float | None = None throughout. An rms of 0.0 is valid
+(digital silence) and must be stored. Truthiness checks (if rms:)
+incorrectly treat 0.0 as falsy. All RMS writes use explicit None
+comparison: if rms is not None.
 
 Speaker ID scheme
 -----------------
 IDs are assigned in discovery order: TRUST_SPK_01, TRUST_SPK_02, ...
-
-TRUST_SPK_01 is the most stable speaker found in the first chunk —
-not necessarily the officer or mic wearer. Role assignment is
-deferred to the GroundTruth Interface in Phase 7.
-
-Match threshold
----------------
-MATCH_THRESHOLD = 0.65 cosine similarity.
-
-Below this, an embedding is closer to "unknown new speaker" than any
-existing anchor. Chosen to sit above the 0.05 ambiguity margin.
-After collecting a BWC corpus, calibrate against known same-speaker /
-different-speaker pairs and document the dataset here.
+TRUST_SPK_01 is the most embedding-stable speaker in the first chunk.
+Role assignment (officer, subject, bystander) is deferred to Phase 7.
 
 Thread safety
 -------------
-Not thread-safe. engine.py processes chunks sequentially — do not
+Not thread-safe. engine.py processes chunks sequentially. Do not
 share a vault instance across threads.
 
 Contributors
 ------------
-    Diarization and chunking logic belongs in engine.py.
-    Pyannote calls belong in engine.py.
+    Chunking and pyannote calls belong in engine.py.
     Gate logic belongs in gates.py.
-    Do not add per-chunk processing here.
+    Pure computations belong in matching.py and metrics.py.
+    Data structures belong in types.py.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -104,113 +87,31 @@ from ..segment import (
     AMBIGUITY_MARGIN,
     FLAG_AMBIGUOUS_MATCH,
     FLAG_HIGH_VARIANCE_SPEAKER,
-    FLAG_LOW_CONFIDENCE,
-    FLAG_MEDIUM_CONFIDENCE,
     FLAG_OUTLIER_EMBEDDING,
     FLAG_PROVISIONAL,
-    REID_HIGH_THRESHOLD,
-    REID_MEDIUM_THRESHOLD,
     TimelineSegment,
+)
+from .matching import apply_reid_flags, find_best_match
+from .metrics import build_quality_block, compute_spread, rejected_for_speaker
+from .types import (
+    HIGH_VARIANCE_THRESHOLD,
+    MATCH_THRESHOLD,
+    SPEAKER_ID_PREFIX,
+    HistoryEntry,
+    RejectedEntry,
+    VaultEntry,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-#: Cosine similarity threshold for matching an embedding to an existing anchor.
-#: Below this, the embedding is treated as a previously unseen speaker.
-#: Sits above the 0.05 ambiguity margin to prevent near-misses from
-#: collapsing two speakers into one identity.
-#: Calibrate against a real BWC corpus — document dataset in a comment here.
-MATCH_THRESHOLD: float = 0.65
-
-#: Speaker ID prefix. All global IDs follow TRUST_SPK_NN format.
-SPEAKER_ID_PREFIX: str = "TRUST_SPK"
-
-#: Embedding spread std_dev above which a speaker is flagged
-#: HIGH_VARIANCE_SPEAKER in vault metadata. May indicate identity confusion.
-HIGH_VARIANCE_THRESHOLD: float = 0.20
-
-
-# ---------------------------------------------------------------------------
-# Internal per-speaker record
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _VaultEntry:
-    """
-    Internal per-speaker record. Not exposed outside this module.
-
-    Attributes
-    ----------
-    speaker_id : str
-        Global speaker ID, e.g. "TRUST_SPK_01".
-    centroid : np.ndarray
-        Current 512-d centroid. Updated on every accepted embedding
-        via incremental running mean.
-    count : int
-        Number of embeddings merged into this centroid. Required for
-        correct running mean: new = (old * n + emb) / (n + 1).
-    total_duration : float
-        Cumulative speech seconds assigned to this speaker.
-    rms_values : list[float]
-        RMS energy per accepted segment. Metadata only — drives no
-        matching decisions. Available for downstream speaker prominence
-        analysis.
-    history : list[dict]
-        Every accepted embedding in order of occurrence.
-        Each entry: {"segment_id": int, "embedding": np.ndarray,
-                     "timestamp": float}
-        Used post-run to compute spread metrics and by Phase 2
-        for identity stability analysis.
-    """
-    speaker_id: str
-    centroid: np.ndarray
-    count: int = 1
-    total_duration: float = 0.0
-    rms_values: list[float] = field(default_factory=list)
-    history: list[dict] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Rejected embedding record
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _RejectedEntry:
-    """
-    One rejected embedding, stored in SpeakerVault.rejected_history
-    keyed by rejection reason string.
-
-    speaker_id is None when the rejection occurred before a global ID
-    could be confirmed (e.g. Gate 3 failure on a new anchor candidate).
-    """
-    segment_id: int
-    embedding: np.ndarray
-    timestamp: float
-    speaker_id: str | None
-
-
-# ---------------------------------------------------------------------------
-# SpeakerVault
-# ---------------------------------------------------------------------------
-
 class SpeakerVault:
     """
     Global speaker identity vault for TrustScript Stage 5.
 
-    Maintains one centroid per discovered speaker. Matches incoming
-    embeddings via cosine similarity and updates centroids using an
-    incremental running mean. All centroid writes are gated.
-
-    Usage
-    -----
     Instantiate once per file. Pass to engine.py's chunking loop.
-    After all chunks are processed, call get_vault_metadata() for
-    Stage 7 output assembly.
+    After all chunks are processed, call get_vault_metadata() to
+    assemble Stage 7 output.
 
         vault = SpeakerVault()
         for chunk in chunks:
@@ -220,21 +121,18 @@ class SpeakerVault:
     """
 
     def __init__(self) -> None:
-        # Public — read by gates.py and engine.py.
+        # Public — read by gates.py, engine.py, and stage5.py.
         self.anchors: dict[str, np.ndarray] = {}
         self.counts: dict[str, int] = {}
         self.durations: dict[str, float] = {}
         self.rms_values: dict[str, list[float]] = {}
         self.history: dict[str, list[dict]] = {}
-        # Keyed by rejection reason string, not by speaker.
-        # engine.py and gates.py read this for audit trail.
-        self.rejected_history: dict[str, list[_RejectedEntry]] = {}
+        # Keyed by rejection reason string. Read by Phase 2.
+        self.rejected_history: dict[str, list[RejectedEntry]] = {}
 
-        # Internal state.
+        # Internal.
         self._next_speaker_num: int = 1
-        self._entries: dict[str, _VaultEntry] = {}
-
-        # Vault-level counters for quality block.
+        self._entries: dict[str, VaultEntry] = {}
         self._total_embeddings: int = 0
         self._accepted_embeddings: int = 0
 
@@ -246,11 +144,12 @@ class SpeakerVault:
         self,
         segment: TimelineSegment,
         embedding: np.ndarray,
-        rms: float = 0.0,
+        rms: float | None = None,
         candidate_embeddings: list[np.ndarray] | None = None,
     ) -> str:
         """
         Match an embedding against existing anchors or create a new one.
+
         Mutates segment.speaker, segment.reid_score, and segment.flags.
 
         Parameters
@@ -259,22 +158,24 @@ class SpeakerVault:
             Segment being matched. Mutated in place.
         embedding : np.ndarray
             512-d ECAPA-TDNN embedding for this segment.
-        rms : float
+        rms : float | None
             RMS energy of this segment. Stored as metadata.
+            0.0 is a valid value (digital silence) and is stored.
+            None means RMS was not computed — not stored.
         candidate_embeddings : list[np.ndarray] | None
             All clean embeddings for this local speaker label in the
-            current chunk. Required for Gate 3 when the speaker has no
-            existing vault entry. Safe to pass for existing speakers —
-            Gate 3 only runs when is_new_anchor=True.
+            current chunk. Required for Gate 3 when the speaker has
+            no existing vault entry. Safe to pass for existing speakers
+            — Gate 3 only runs when is_new_anchor=True.
 
         Returns
         -------
         str
-            The global speaker ID assigned to the segment.
+            Global speaker ID assigned to the segment.
         """
         self._total_embeddings += 1
 
-        best_id, best_score, second_score = self._find_best_match(embedding)
+        best_id, best_score, second_score = find_best_match(embedding, self.anchors)
         is_new_anchor = (best_id is None) or (best_score < MATCH_THRESHOLD)
 
         if not is_new_anchor:
@@ -293,31 +194,28 @@ class SpeakerVault:
         global_id: str,
         embedding: np.ndarray,
         segment: TimelineSegment,
-        rms: float = 0.0,
+        rms: float | None = None,
     ) -> None:
         """
         Directly seed a new vault entry, bypassing gate checks.
 
         Called ONLY by stage5.py's vault initialization logic, after
-        that code has already applied its own stricter checks (SNR
-        context, quality windows, stability). The gate bypass is
-        intentional and documented — initialization has higher
-        standards than the per-segment loop gates.
+        that code has applied its own stricter checks (SNR context,
+        quality windows, stability). The gate bypass is intentional.
 
-        Do NOT call from engine.py's main chunking loop.
+        Do NOT call from engine.py's chunking loop.
         Use match_or_create() for all runtime segments.
 
         Parameters
         ----------
         global_id : str
             Pre-assigned global ID, e.g. "TRUST_SPK_01".
-            Must follow TRUST_SPK_NN format.
         embedding : np.ndarray
             Seed embedding for this anchor.
         segment : TimelineSegment
             Originating segment (for history record).
-        rms : float
-            RMS energy of the seed segment.
+        rms : float | None
+            RMS energy. 0.0 is valid and stored. None = not computed.
 
         Raises
         ------
@@ -329,14 +227,15 @@ class SpeakerVault:
                 f"seed_anchor() called for existing speaker {global_id}. "
                 "Use match_or_create() to update existing anchors."
             )
-        # Keep the speaker counter ahead of all seeded IDs so that
-        # _assign_new_id() never collides with a seeded entry.
+        # Keep the speaker counter ahead of all seeded IDs.
         num = int(global_id.split("_")[-1])
         if num >= self._next_speaker_num:
             self._next_speaker_num = num + 1
 
         self._create_entry(global_id, embedding, segment, rms)
-        logger.debug("Vault: seeded anchor %s (segment %d)", global_id, segment.segment_id)
+        logger.debug(
+            "Vault: seeded anchor %s (segment %d)", global_id, segment.segment_id
+        )
 
     def get_history_distances(self, global_id: str) -> list[float]:
         """
@@ -349,8 +248,8 @@ class SpeakerVault:
         Returns
         -------
         list[float]
-            Cosine distances (0=identical, 1=orthogonal).
-            Empty list if speaker is not in the vault.
+            Cosine distances in [0, 1] (0=identical, 1=orthogonal).
+            Empty list if the speaker is not in the vault.
         """
         if global_id not in self._entries:
             return []
@@ -367,21 +266,20 @@ class SpeakerVault:
         Returns a dict with three keys:
 
         "speakers"
-            Per-speaker spread metrics, duration, segment count.
-            No raw embedding arrays. Written to phase1.json.
+            Per-speaker spread metrics, duration, segment count, flags.
+            No raw embeddings. Written to phase1.json.
 
         "vault_quality"
-            Aggregate counts and vault_purity_estimate.
-            Written to phase1.json and vault.json.
+            Aggregate accepted/rejected counts and vault_purity_estimate.
+            Written to both phase1.json and vault.json.
 
         "vault_detail"
-            Full embedding history per speaker plus rejected embeddings
-            per speaker. Written to vault.json only.
-            Suppressed when --no-vault is passed to the CLI.
+            Full embedding history plus rejected embeddings per speaker.
+            Written to vault.json only. Suppressed by --no-vault.
         """
         speakers = []
         for gid, entry in sorted(self._entries.items()):
-            spread = self._compute_spread(entry)
+            spread = compute_spread(entry)
             flags = []
             if (
                 spread["std_dev"] is not None
@@ -403,12 +301,16 @@ class SpeakerVault:
                 "flags": flags,
             })
 
-        vault_quality = self._build_quality_block()
+        vault_quality = build_quality_block(
+            self._total_embeddings,
+            self._accepted_embeddings,
+            self.rejected_history,
+        )
 
         vault_detail = {
             gid: {
                 "centroid": entry.centroid.tolist(),
-                "embedding_spread": self._compute_spread(entry),
+                "embedding_spread": compute_spread(entry),
                 "history": [
                     {
                         "segment_id": h["segment_id"],
@@ -417,7 +319,9 @@ class SpeakerVault:
                     }
                     for h in entry.history
                 ],
-                "rejected_history": self._rejected_for_speaker(gid),
+                "rejected_history": rejected_for_speaker(
+                    gid, self.rejected_history
+                ),
             }
             for gid, entry in sorted(self._entries.items())
         }
@@ -436,18 +340,17 @@ class SpeakerVault:
         self,
         segment: TimelineSegment,
         embedding: np.ndarray,
-        rms: float,
+        rms: float | None,
         best_id: str,
         best_score: float,
         second_score: float | None,
         candidate_embeddings: list[np.ndarray] | None,
     ) -> None:
-        """Handle the existing-anchor path of match_or_create."""
+        """Existing-anchor path of match_or_create."""
         segment.speaker = best_id
         segment.reid_score = float(best_score)
-        self._apply_reid_flags(segment)
+        apply_reid_flags(segment)
 
-        # Ambiguity check: top-2 scores within AMBIGUITY_MARGIN.
         if (
             second_score is not None
             and (best_score - second_score) <= AMBIGUITY_MARGIN
@@ -474,9 +377,11 @@ class SpeakerVault:
         else:
             if reason == "OUTLIER_EMBEDDING" and FLAG_OUTLIER_EMBEDDING not in segment.flags:
                 segment.flags.append(FLAG_OUTLIER_EMBEDDING)
-            self._record_rejection(reason or "UNKNOWN_REJECTION", segment, embedding, best_id)
+            self._record_rejection(
+                reason or "UNKNOWN_REJECTION", segment, embedding, best_id
+            )
             logger.debug(
-                "Segment %d: vault rejection (%s) for %s — centroid not updated.",
+                "Segment %d: vault rejection (%s) for %s — centroid unchanged.",
                 segment.segment_id, reason, best_id,
             )
 
@@ -484,10 +389,10 @@ class SpeakerVault:
         self,
         segment: TimelineSegment,
         embedding: np.ndarray,
-        rms: float,
+        rms: float | None,
         candidate_embeddings: list[np.ndarray] | None,
     ) -> None:
-        """Handle the new-speaker path of match_or_create."""
+        """New-speaker path of match_or_create."""
         speculative_id = self._assign_new_id()
         segment.speaker = speculative_id
         segment.reid_score = 1.0
@@ -509,11 +414,13 @@ class SpeakerVault:
                 speculative_id, segment.segment_id, segment.start_seconds,
             )
         else:
-            # Roll back the speculative ID — this speaker is not vault-worthy.
+            # Roll back — this speaker is not vault-worthy.
             self._next_speaker_num -= 1
             segment.speaker = "UNKNOWN"
             segment.reid_score = None
-            self._record_rejection(reason or "UNKNOWN_REJECTION", segment, embedding, speaker_id=None)
+            self._record_rejection(
+                reason or "UNKNOWN_REJECTION", segment, embedding, speaker_id=None
+            )
             logger.debug(
                 "Segment %d: new anchor rejected (%s) — ID rolled back.",
                 segment.segment_id, reason,
@@ -528,24 +435,24 @@ class SpeakerVault:
         global_id: str,
         embedding: np.ndarray,
         segment: TimelineSegment,
-        rms: float,
+        rms: float | None,
     ) -> None:
         """
         Initialize a new vault entry for a previously unseen speaker.
-        Only called after all gate checks pass (or from seed_anchor).
+        Only called after gate checks pass (or from seed_anchor).
         """
-        entry = _VaultEntry(
+        entry = VaultEntry(
             speaker_id=global_id,
             centroid=embedding.copy(),
             count=1,
             total_duration=segment.duration_seconds,
-            rms_values=[rms] if rms else [],
+            rms_values=[rms] if rms is not None else [],
             history=[
-                {
-                    "segment_id": segment.segment_id,
-                    "embedding": embedding.copy(),
-                    "timestamp": segment.start_seconds,
-                }
+                HistoryEntry(
+                    segment_id=segment.segment_id,
+                    embedding=embedding.copy(),
+                    timestamp=segment.start_seconds,
+                )
             ],
         )
         self._entries[global_id] = entry
@@ -557,14 +464,13 @@ class SpeakerVault:
         global_id: str,
         embedding: np.ndarray,
         segment: TimelineSegment,
-        rms: float,
+        rms: float | None,
     ) -> None:
         """
         Merge an embedding into an existing centroid via running mean.
 
             new_centroid = (old_centroid * n + embedding) / (n + 1)
 
-        Preserves equal weighting across all historical embeddings.
         Only called after gate checks pass.
         """
         entry = self._entries[global_id]
@@ -572,13 +478,13 @@ class SpeakerVault:
         entry.centroid = (entry.centroid * n + embedding) / (n + 1)
         entry.count += 1
         entry.total_duration += segment.duration_seconds
-        if rms:
+        if rms is not None:
             entry.rms_values.append(rms)
-        entry.history.append({
-            "segment_id": segment.segment_id,
-            "embedding": embedding.copy(),
-            "timestamp": segment.start_seconds,
-        })
+        entry.history.append(HistoryEntry(
+            segment_id=segment.segment_id,
+            embedding=embedding.copy(),
+            timestamp=segment.start_seconds,
+        ))
         self._sync_public_dicts(global_id, entry)
         self._accepted_embeddings += 1
 
@@ -589,37 +495,8 @@ class SpeakerVault:
         )
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Internal helpers
     # ------------------------------------------------------------------
-
-    def _find_best_match(
-        self, embedding: np.ndarray
-    ) -> tuple[str | None, float, float | None]:
-        """
-        Score the embedding against all anchors via cosine similarity.
-
-        Returns
-        -------
-        tuple[str | None, float, float | None]
-            (best_id, best_score, second_score)
-            best_id is None when the vault is empty.
-            second_score is None when fewer than 2 anchors exist.
-        """
-        if not self.anchors:
-            return None, 0.0, None
-
-        scores: list[tuple[str, float]] = sorted(
-            (
-                (gid, 1.0 - float(cosine(embedding, centroid)))
-                for gid, centroid in self.anchors.items()
-            ),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-
-        best_id, best_score = scores[0]
-        second_score = scores[1][1] if len(scores) >= 2 else None
-        return best_id, best_score, second_score
 
     def _assign_new_id(self) -> str:
         """Allocate the next TRUST_SPK_NN identifier."""
@@ -627,28 +504,13 @@ class SpeakerVault:
         self._next_speaker_num += 1
         return gid
 
-    def _sync_public_dicts(self, global_id: str, entry: _VaultEntry) -> None:
+    def _sync_public_dicts(self, global_id: str, entry: VaultEntry) -> None:
         """Keep the public-facing dicts consistent with the entry object."""
         self.anchors[global_id] = entry.centroid
         self.counts[global_id] = entry.count
         self.durations[global_id] = entry.total_duration
         self.rms_values[global_id] = entry.rms_values
         self.history[global_id] = entry.history
-
-    def _apply_reid_flags(self, segment: TimelineSegment) -> None:
-        """
-        Set MEDIUM_CONFIDENCE or LOW_CONFIDENCE based on reid_score.
-        HIGH confidence (>= REID_HIGH_THRESHOLD) is silent — no flag.
-        Idempotent — safe to call multiple times on the same segment.
-        """
-        if segment.reid_score is None:
-            return
-        if segment.reid_score < REID_MEDIUM_THRESHOLD:
-            if FLAG_LOW_CONFIDENCE not in segment.flags:
-                segment.flags.append(FLAG_LOW_CONFIDENCE)
-        elif segment.reid_score < REID_HIGH_THRESHOLD:
-            if FLAG_MEDIUM_CONFIDENCE not in segment.flags:
-                segment.flags.append(FLAG_MEDIUM_CONFIDENCE)
 
     def _record_rejection(
         self,
@@ -661,89 +523,10 @@ class SpeakerVault:
         if reason not in self.rejected_history:
             self.rejected_history[reason] = []
         self.rejected_history[reason].append(
-            _RejectedEntry(
+            RejectedEntry(
                 segment_id=segment.segment_id,
                 embedding=embedding.copy(),
                 timestamp=segment.start_seconds,
                 speaker_id=speaker_id,
             )
         )
-
-    def _rejected_for_speaker(self, global_id: str) -> dict[str, list[dict]]:
-        """
-        Filter rejected_history for entries belonging to this speaker,
-        serialized by reason. Used by get_vault_metadata() for vault.json.
-        Entries with speaker_id=None (Gate 3 failures on new anchors)
-        are not attributed to any speaker and are excluded.
-        """
-        result: dict[str, list[dict]] = {}
-        for reason, entries in self.rejected_history.items():
-            matching = [
-                {
-                    "segment_id": e.segment_id,
-                    "timestamp": e.timestamp,
-                    "embedding": e.embedding.tolist(),
-                }
-                for e in entries
-                if e.speaker_id == global_id
-            ]
-            if matching:
-                result[reason] = matching
-        return result
-
-    def _build_quality_block(self) -> dict:
-        """
-        Build the vault_quality block for phase1.json output.
-
-        GRACE_PERIOD_OUTLIER and OUTLIER_EMBEDDING are counted
-        separately so calibration can distinguish early-segment
-        anomalies from mature-history outliers.
-        """
-        total_rejected = sum(len(v) for v in self.rejected_history.values())
-        return {
-            "total_embeddings_extracted": self._total_embeddings,
-            "accepted_into_vault": self._accepted_embeddings,
-            "rejected_overlap": len(self.rejected_history.get("OVERLAP_REJECTED", [])),
-            "rejected_too_short": len(self.rejected_history.get("TOO_SHORT", [])),
-            "rejected_outlier": len(self.rejected_history.get("OUTLIER_EMBEDDING", [])),
-            "rejected_grace_period_outlier": len(
-                self.rejected_history.get("GRACE_PERIOD_OUTLIER", [])
-            ),
-            "rejected_insufficient_segments": len(
-                self.rejected_history.get("INSUFFICIENT_SEGMENTS", [])
-            ),
-            "rejected_unstable_embeddings": len(
-                self.rejected_history.get("UNSTABLE_EMBEDDINGS", [])
-            ),
-            "rejected_total": total_rejected,
-            "vault_purity_estimate": round(
-                self._accepted_embeddings / self._total_embeddings, 4
-            ) if self._total_embeddings > 0 else 0.0,
-        }
-
-    @staticmethod
-    def _compute_spread(entry: _VaultEntry) -> dict:
-        """
-        Compute embedding spread metrics for a vault entry.
-
-        All values are None if fewer than 2 embeddings exist —
-        spread is undefined for a single-embedding anchor.
-
-        Returns dict with: mean_cosine_distance, max_cosine_distance, std_dev.
-        """
-        if len(entry.history) < 2:
-            return {
-                "mean_cosine_distance": None,
-                "max_cosine_distance": None,
-                "std_dev": None,
-            }
-        centroid = entry.centroid
-        distances = [
-            float(cosine(h["embedding"], centroid))
-            for h in entry.history
-        ]
-        return {
-            "mean_cosine_distance": round(float(np.mean(distances)), 6),
-            "max_cosine_distance": round(float(np.max(distances)), 6),
-            "std_dev": round(float(np.std(distances)), 6),
-        }
