@@ -33,7 +33,7 @@ Internal types
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import Final, NamedTuple
 
 import numpy as np
 
@@ -47,21 +47,28 @@ from ..vault import SpeakerVault
 
 #: Overlap between adjacent chunks. NOT configurable — correctness requirement.
 #: See engine.py module docstring: Seam management strategy.
-CHUNK_OVERLAP: float = 10.0  # seconds
+CHUNK_OVERLAP: Final[float] = 10.0  # seconds
 
 #: Half of CHUNK_OVERLAP. Trimmed symmetrically from each non-edge boundary.
-SEAM_HALF: float = CHUNK_OVERLAP / 2.0  # 5.0 seconds
+SEAM_HALF: Final[float] = CHUNK_OVERLAP / 2.0  # 5.0 seconds
 
 #: Default chunk duration for production BWC footage.
-DEFAULT_CHUNK_SIZE: float = 300.0  # seconds
+DEFAULT_CHUNK_SIZE: Final[float] = 300.0  # seconds
 
 #: Minimum segment duration to process. Below this, pyannote has produced a
 #: boundary sliver — no reliable embedding can be extracted.
-MIN_SEGMENT_DURATION: float = 0.1  # seconds
+MIN_SEGMENT_DURATION: Final[float] = 0.1  # seconds
 
 #: Minimum waveform / embedding L2 norm below which the signal is treated
 #: as silence or corruption. Prevents NaN cosine distances downstream.
-ZERO_VECTOR_THRESHOLD: float = 1e-8
+ZERO_VECTOR_THRESHOLD: Final[float] = 1e-8
+
+#: Canonical dtype for all ECAPA-TDNN embeddings throughout the engine.
+#: float32 is enforced at extraction time in audio.py and must be preserved
+#: through vault storage, cosine matching, and centroid updates.
+#: Accidentally storing float64 doubles RAM per embedding; float16 causes
+#: non-deterministic behaviour in Phase 4 Fusion's cosine arithmetic.
+EMBEDDING_DTYPE: Final[type] = np.float32
 
 
 # ---------------------------------------------------------------------------
@@ -103,24 +110,29 @@ class _RawSegment(NamedTuple):
     """
     Immutable carrier for one segment's Pass 1 data.
 
-    Produced by passes._collect_raw_segments().
-    Consumed by candidates.py and passes._run_vault_matching().
+    Produced by passes.collect_raw_segments().
+    Consumed by candidates.py and passes.run_vault_matching().
 
-    candidate_embeddings is always [] at construction time. The live
-    Gate 3 candidate pool is the candidates_by_label dict managed by
-    candidates.py — _RawSegment.candidate_embeddings is never read
-    after Pass 1 builds that dict.
+    candidate_embeddings is intentionally absent. The Gate 3 pool
+    is a chunk-level structure (local_label → list[embeddings]) managed
+    by candidates.build_candidates_by_label() and passed separately to
+    run_vault_matching(). Carrying an always-empty list on every segment
+    object would add overhead across thousands of segments in a long file
+    with no consumer to justify the cost.
+
+    All embeddings stored here are dtype=EMBEDDING_DTYPE (float32).
+    See EMBEDDING_DTYPE for the rationale.
 
     Attributes
     ----------
     segment : TimelineSegment
         Partially initialized. speaker="UNASSIGNED" until Pass 2.
     embedding : np.ndarray
-        512-d ECAPA-TDNN embedding.
+        512-d ECAPA-TDNN embedding, dtype float32.
     rms : float | None
         RMS energy. None if computation failed or waveform was silent.
-    candidate_embeddings : list[np.ndarray]
-        Always [] — see note above.
+        0.0 is a valid value (digital silence) — callers use
+        `if rms is not None`, never `if rms`.
     overlap_local_labels : list[str]
         Local labels of co-active speakers (e.g. ["SPEAKER_01"]).
         Converted to global IDs after vault matching in Pass 2.
@@ -128,5 +140,4 @@ class _RawSegment(NamedTuple):
     segment: TimelineSegment
     embedding: np.ndarray
     rms: float | None
-    candidate_embeddings: list[np.ndarray]
     overlap_local_labels: list[str]
