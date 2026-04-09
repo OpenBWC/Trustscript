@@ -220,6 +220,13 @@ def _process_chunk(
     audio_input = {"waveform": chunk_waveform, "sample_rate": sample_rate}
 
     # Step 2 — Diarization.
+    # Blocking CPU call — 10–30 min per 5-min chunk on ARM.
+    # No progress feedback from pyannote during this call.
+    logger.info(
+        "Chunk %d: running pyannote inference (%.0fs of audio) — "
+        "this may take several minutes on CPU.",
+        chunk_idx, chunk_end - chunk_start,
+    )
     try:
         diarization: "Annotation" = pipeline(audio_input)
     except Exception as exc:
