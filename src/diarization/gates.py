@@ -107,7 +107,11 @@ MIN_ANCHOR_SEGMENTS: int = 3
 
 #: Maximum mean pairwise cosine distance for new anchor stability check.
 #: Embeddings within this spread are considered a tight, reliable cluster.
-#: Increased from 0.15 for WeSpeaker geometry
+#: Calibrated at 0.30 for pyannote/speaker-diarization-community-1 +
+#: pyannote/embedding (ECAPA-TDNN). The community model's embedding space
+#: has higher natural intra-speaker spread than the original 3.1 weights —
+#: 0.15 was too tight and rejected legitimate single-speaker audio.
+#: Recalibrate against a labelled BWC corpus and document dataset here.
 MAX_ANCHOR_SPREAD: float = 0.30
 
 #: Gate 4 — grace period length.
@@ -121,8 +125,7 @@ MIN_HISTORY_FOR_OUTLIER_CHECK: int = 5
 #: before enough history exists for adaptive mean+3σ thresholding.
 #: 0.25 is permissive enough for natural speaker variation while
 #: catching genuine anomalies (shouting, mic noise, misassignment).
-#: Increased from 0.25 for WeSpeaker geometry
-GRACE_PERIOD_MAX_DISTANCE: float = 0.40
+GRACE_PERIOD_MAX_DISTANCE: float = 0.25
 
 #: Gate 4 — outlier threshold multiplier after grace period ends.
 #: Threshold = mean_distance + (OUTLIER_STD_MULTIPLIER × std_dev).
