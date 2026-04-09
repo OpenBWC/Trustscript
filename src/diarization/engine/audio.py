@@ -58,8 +58,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+import soundfile as sf
 import torch
-import torchaudio
 
 from .types import EMBEDDING_DTYPE, ZERO_VECTOR_THRESHOLD
 
@@ -103,11 +103,19 @@ def load_chunk_audio(
     frame_offset = int(chunk_start * sample_rate)
     num_frames = int((chunk_end - chunk_start) * sample_rate)
 
-    waveform, sr = torchaudio.load(
+    # soundfile.read() with start/stop uses true byte-level seeking on PCM WAV
+    # — no torchcodec, no backend negotiation, no FFmpeg dependency at runtime.
+    # always_2d=True guarantees shape (num_samples, num_channels) even for mono.
+    data, sr = sf.read(
         str(audio_path),
-        frame_offset=frame_offset,
-        num_frames=num_frames,
+        start=frame_offset,
+        stop=frame_offset + num_frames,
+        dtype="float32",
+        always_2d=True,
     )
+    # Convert (num_samples, num_channels) → (num_channels, num_samples)
+    # to match the (1, N) torch convention expected by pyannote.
+    waveform = torch.from_numpy(data.T)
 
     if waveform.shape[0] > 1:
         raise RuntimeError(
