@@ -80,10 +80,14 @@ Contributors
     Document the calibration dataset in a comment here.
 """
 
+import logging
+
 import numpy as np
 from scipy.spatial.distance import cosine
 
 from .segment import FLAG_CONCURRENT_SPEECH, FLAG_GHOST_SPEAKER
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +125,9 @@ MAX_ANCHOR_SPREAD: float = 0.30
 MIN_HISTORY_FOR_OUTLIER_CHECK: int = 5
 
 #: Gate 4 — hard distance cap applied during grace period.
-#: Embeddings further than this from the centroid are rejected even
-#: before enough history exists for adaptive mean+3σ thresholding.
-#: 0.25 is permissive enough for natural speaker variation while
-#: catching genuine anomalies (shouting, mic noise, misassignment).
+#: Calibrated at 0.40 for pyannote/embedding ECAPA-TDNN geometry.
+#: The community model's embedding space has higher natural spread —
+#: 0.25 was rejecting legitimate within-speaker variation.
 GRACE_PERIOD_MAX_DISTANCE: float = 0.40
 
 #: Gate 4 — outlier threshold multiplier after grace period ends.
@@ -267,6 +270,14 @@ def gate_3_new_anchor_stability(
             )
 
     mean_spread = float(np.mean(distances))
+    logger.debug(
+        "Gate 3 stability check: n=%d segments, "
+        "mean_pairwise_spread=%.4f, threshold=%.4f — %s",
+        len(candidate_embeddings),
+        mean_spread,
+        max_spread,
+        "PASS" if mean_spread <= max_spread else "FAIL (UNSTABLE_EMBEDDINGS)",
+    )
     if mean_spread > max_spread:
         return False, "UNSTABLE_EMBEDDINGS"
 
