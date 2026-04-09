@@ -27,6 +27,9 @@ from .main import trustscript
 # Phase 1 — Speaker Diarization Engine (implemented)
 from .diarize import diarize
 
+# Developer Sandbox — Raw Pyannote Inspection (implemented)
+from .probe import probe
+
 # Phase 2 — Overlap Characterization (stub)
 from .overlap import overlap
 
@@ -44,6 +47,7 @@ from .run import run_pipeline
 
 # Register all subcommands onto the main group.
 trustscript.add_command(diarize)
+trustscript.add_command(probe)       # <-- Registered here
 trustscript.add_command(overlap)
 trustscript.add_command(transcribe)
 trustscript.add_command(fuse)
