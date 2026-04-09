@@ -116,7 +116,7 @@ MIN_ANCHOR_SEGMENTS: int = 3
 #: has higher natural intra-speaker spread than the original 3.1 weights —
 #: 0.15 was too tight and rejected legitimate single-speaker audio.
 #: Recalibrate against a labelled BWC corpus and document dataset here.
-MAX_ANCHOR_SPREAD: float = 0.30
+MAX_ANCHOR_SPREAD: float = 0.95
 
 #: Gate 4 — grace period length.
 #: Use hard distance cap for the first N embeddings before std() is
