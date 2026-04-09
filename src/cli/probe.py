@@ -3,32 +3,34 @@ src/cli/probe.py
 ================
 TrustScript CLI — Sandbox Tool for Raw Model Inspection
 
-Owns:
-    - The `trustscript probe` Click command.
-
 Responsibility
 --------------
-Bypass the TrustScript Engine, Vault, and Gate system entirely. 
-Loads the raw pyannote community-1 model and runs it against a target
-audio file. Used purely for developer debugging to understand base
-model behavior, API changes, and raw probability outputs.
+Executes TrustScript preprocessing (Stages 1-4) to safely extract and 
+normalize audio (supporting .mp4, etc.), then bypasses the Phase 1 
+Engine entirely. 
+
+Runs the raw pyannote community-1 model against the normalized audio 
+to output the unwrapped Annotation and raw segmentation probabilities.
+Used purely for developer debugging to understand base model behavior.
 """
 
 import logging
 from pathlib import Path
+import sys
 
 import click
-import torch
-from pyannote.audio import Pipeline
 from dotenv import load_dotenv
 
-from .main import console
+from .main import configure_logging, console
 
 
 @click.command("probe")
-@click.argument(
-    "audio_path",
+@click.option(
+    "--input", "-i",
+    "input_path",
+    required=True,
     type=click.Path(exists=True, dir_okay=False),
+    help="Path to a single BWC video/audio file.",
 )
 @click.option(
     "--token",
@@ -36,79 +38,119 @@ from .main import console
     envvar="HF_TOKEN",
     help="HuggingFace access token.",
 )
-def probe_model(audio_path: str, token: str | None) -> None:
+@click.option(
+    "--models-dir",
+    default=None,
+    type=click.Path(exists=True, file_okay=False),
+    help="Path to local pyannote weights.",
+)
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    default=False,
+    help="Enable DEBUG-level logging.",
+)
+def probe(input_path: str, token: str | None, models_dir: str | None, verbose: bool) -> None:
     """
-    Developer Sandbox: Run raw pyannote inference on an audio file.
+    Developer Sandbox: Run raw pyannote inference on an audio/video file.
 
-    Bypasses the TrustScript Phase 1 pipeline entirely to output the
-    raw underlying Pyannote objects, including the unwrapped Annotation
-    and the raw segmentation probabilities.
+    Executes TrustScript Stages 1-4 to normalize the input, then runs 
+    a single full-file inference pass to print the raw Pyannote V4 
+    objects and segmentation probabilities.
     """
     load_dotenv()
-    
-    # 1. Hardware Detection
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        console.print("[green]Hardware acceleration (Apple MPS) active.[/green]")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        console.print("[green]Hardware acceleration (CUDA) active.[/green]")
-    else:
-        device = torch.device("cpu")
-        console.print("[yellow]No hardware acceleration. Using CPU.[/yellow]")
+    configure_logging(verbose, None)
+    log = logging.getLogger(__name__)
 
-    # 2. Load Model
-    console.print(f"Loading pyannote/speaker-diarization-community-1...")
+    file = Path(input_path)
+    incident_id = file.stem
+    output_dir = Path("data")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    console.rule(f"[bold]PROBE SANDBOX: {file.name}[/bold]")
+
     try:
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-community-1",
-            use_auth_token=token,
+        # --- STAGE 1: Format Detection ---
+        console.print("[dim]Running Stage 1 (Input Handling)...[/dim]")
+        from src.utils.audio import run_stage1
+        stage1_result = run_stage1(file)
+
+        # --- AUDIO EXTRACTION ---
+        console.print("[dim]Extracting audio...[/dim]")
+        from src.utils.audio.extraction import extract_working_audio
+        working_audio_path, _, _ = extract_working_audio(
+            stage1_result.original_path, output_dir, incident_id
         )
-        pipeline.to(device)
-    except Exception as e:
-        console.print(f"[red]Failed to load model: {e}[/red]")
-        return
 
-    # 3. Inference
-    console.print(f"Running inference on {Path(audio_path).name}...")
+        # --- STAGE 2: Profiling ---
+        console.print("[dim]Running Stage 2 (Quality Profiling)...[/dim]")
+        from src.utils.audio import run_stage2
+        stage2_result = run_stage2(stage1_result, working_audio_path)
+
+        # --- STAGE 3: Normalization ---
+        console.print("[dim]Running Stage 3 (16kHz Mono Normalization)...[/dim]")
+        from src.utils.normalization import run_stage3
+        stage3_result = run_stage3(
+            stage1_result, working_audio_path, output_dir, incident_id
+        )
+        normalized_wav = stage3_result.normalized_path
+
+        # --- STAGE 4: Model Loading ---
+        console.print("[dim]Running Stage 4 (Loading pyannote)...[/dim]")
+        from src.diarization.models import run_stage4
+        stage4_result = run_stage4(token=token, models_dir=Path(models_dir) if models_dir else None)
+        pipeline = stage4_result.pipeline
+
+    except Exception as e:
+        console.print(f"[red]Preprocessing failed: {e}[/red]")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # SANDBOX INFERENCE
+    # ------------------------------------------------------------------
+    console.print("\n[bold yellow]Preprocessing complete. Starting full-file inference...[/bold yellow]")
+    console.print("[dim](This may take several minutes depending on file length and hardware)[/dim]")
+
     try:
-        # Note: For this raw test, we can pass the filepath directly to pyannote
-        # rather than building the waveform dictionary we need for the main engine.
-        raw_output = pipeline(audio_path)
+        # Run standard diarization
+        raw_output = pipeline(str(normalized_wav))
     except Exception as e:
         console.print(f"[red]Inference failed: {e}[/red]")
-        return
+        sys.exit(1)
 
-    # 4. Unwrap the DiarizeOutput (The v4 API shift)
-    console.print("\n[bold cyan]=== BASE DIARIZATION OUTPUT ===[/bold cyan]")
+    # Unwrap DiarizeOutput
+    console.print("\n[bold cyan]=== BASE DIARIZATION OUTPUT (Unwrapped Annotation) ===[/bold cyan]")
     diarization = getattr(raw_output, "speaker_diarization", raw_output)
     
     for turn, _, speaker in diarization.itertracks(yield_label=True):
-        console.print(f"  [{turn.start:05.2f}s -> {turn.end:05.2f}s] {speaker}")
+        console.print(f"  [{turn.start:06.2f}s -> {turn.end:06.2f}s] {speaker}")
 
-    # 5. Extract Raw Probabilities (The Posteriors API shift)
+    # Extract Raw Probabilities
     console.print("\n[bold cyan]=== RAW SEGMENTATION PROBABILITIES ===[/bold cyan]")
     try:
-        # This calls the internal segmentation model directly to get the raw float math
-        posteriors = pipeline._segmentation(audio_path)
-        
-        # posteriors.data is a numpy array of shape (num_frames, num_speakers)
-        data = posteriors.data
+        posteriors = pipeline._segmentation(str(normalized_wav))
+        data = posteriors.data  # shape: (frames, speakers)
         frames, speakers = data.shape
         
-        console.print(f"  Shape: {frames} frames x {speakers} speakers detected.")
-        console.print("  [dim](Each frame represents ~16ms of audio. Values are probabilities 0.0 to 1.0)[/dim]\n")
+        console.print(f"  [green]Success:[/green] Matrix shape: {frames} frames x {speakers} speakers.")
+        console.print("  [dim]Showing first 25 frames where max probability > 0.1:[/dim]\n")
         
-        # Print a sample of the first 10 frames that contain actual speech
         printed = 0
         for i, frame in enumerate(data):
-            # Only print frames where at least one speaker has > 10% probability
             if frame.max() > 0.1:
-                probs = ", ".join([f"Spk{j}: {p:.2f}" for j, p in enumerate(frame)])
-                console.print(f"  Frame {i:04d}: {probs}")
-                printed += 1
-            if printed >= 10:
-                break
+                # Format: Spk0: 0.95, Spk1: 0.02, etc.
+                probs = ", ".join([f"Spk{j}: {p:.3f}" for j, p in enumerate(frame)])
                 
+                # Check for overlap (Sum of top 2 > 1.0)
+                sorted_probs = sorted(frame, reverse=True)
+                overlap_flag = " [red]<-- OVERLAP[/red]" if (len(sorted_probs) > 1 and sorted_probs[0] + sorted_probs[1] > 1.0) else ""
+                
+                console.print(f"  Frame {i:05d}: {probs}{overlap_flag}")
+                printed += 1
+            if printed >= 25:
+                break
+
     except Exception as e:
         console.print(f"[red]Failed to extract probabilities: {e}[/red]")
+
+    console.rule("[bold]Probe Complete[/bold]")
