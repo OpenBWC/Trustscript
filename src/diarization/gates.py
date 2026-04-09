@@ -125,7 +125,7 @@ MIN_HISTORY_FOR_OUTLIER_CHECK: int = 5
 #: before enough history exists for adaptive mean+3σ thresholding.
 #: 0.25 is permissive enough for natural speaker variation while
 #: catching genuine anomalies (shouting, mic noise, misassignment).
-GRACE_PERIOD_MAX_DISTANCE: float = 0.25
+GRACE_PERIOD_MAX_DISTANCE: float = 0.40
 
 #: Gate 4 — outlier threshold multiplier after grace period ends.
 #: Threshold = mean_distance + (OUTLIER_STD_MULTIPLIER × std_dev).
