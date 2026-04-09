@@ -107,7 +107,8 @@ MIN_ANCHOR_SEGMENTS: int = 3
 
 #: Maximum mean pairwise cosine distance for new anchor stability check.
 #: Embeddings within this spread are considered a tight, reliable cluster.
-MAX_ANCHOR_SPREAD: float = 0.15
+#: Increased from 0.15 for WeSpeaker geometry
+MAX_ANCHOR_SPREAD: float = 0.30
 
 #: Gate 4 — grace period length.
 #: Use hard distance cap for the first N embeddings before std() is
@@ -120,7 +121,8 @@ MIN_HISTORY_FOR_OUTLIER_CHECK: int = 5
 #: before enough history exists for adaptive mean+3σ thresholding.
 #: 0.25 is permissive enough for natural speaker variation while
 #: catching genuine anomalies (shouting, mic noise, misassignment).
-GRACE_PERIOD_MAX_DISTANCE: float = 0.25
+#: Increased from 0.25 for WeSpeaker geometry
+GRACE_PERIOD_MAX_DISTANCE: float = 0.40
 
 #: Gate 4 — outlier threshold multiplier after grace period ends.
 #: Threshold = mean_distance + (OUTLIER_STD_MULTIPLIER × std_dev).
