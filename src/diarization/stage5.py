@@ -273,6 +273,36 @@ def run_stage5(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
+    # Checkpoint interception.
+    # If a timeline file already exists with a valid status, skip the
+    # engine entirely. This prevents re-running hours of diarization
+    # when the pipeline crashed in Stage 6 or later.
+    #
+    # Valid resume statuses:
+    #   stage5_complete  — Stage 5 finished, Stage 6 not yet started.
+    #   stage6_complete  — Stage 6 re-scored the timeline.
+    #   stage7_complete  — Full pipeline completed.
+    #
+    # Vault limitation: the vault cannot currently be restored from disk
+    # on resume. The returned Stage5Result carries an empty vault.
+    # Stage 6 reads the timeline file directly and does not depend on
+    # the in-memory vault for its re-scoring pass. Full vault resumption
+    # will be implemented when _vault.json deserialization is added.
+    #
+    # Corruption handling: a partially written file (interrupted write)
+    # will fail json.load() and trigger a warning + full re-run.
+    # The atomic write pattern in _write_timeline_json prevents this
+    # from occurring on writes produced by this version of the code.
+    # ------------------------------------------------------------------
+    timeline_path = output_dir / f"{incident_id}{_TIMELINE_SUFFIX}"
+    resume_result = _try_resume_from_checkpoint(
+        timeline_path=timeline_path,
+        incident_id=incident_id,
+    )
+    if resume_result is not None:
+        return resume_result
+
+    # ------------------------------------------------------------------
     # Vault initialization decision.
     # Read file-level SNR from Stage 2 to decide whether the opening
     # is too chaotic for confident vault seeding.
@@ -410,6 +440,104 @@ def run_stage5(
         snr_db_refined=snr_db_refined,
         snr_db_refined_classification=snr_db_refined_classification,
         low_anchor_confidence=low_anchor_confidence,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint resumption
+# ---------------------------------------------------------------------------
+
+#: Timeline file statuses that indicate Stage 5 has already completed.
+_RESUMABLE_STATUSES: frozenset[str] = frozenset({
+    "stage5_complete",
+    "stage6_complete",
+    "stage7_complete",
+})
+
+
+def _try_resume_from_checkpoint(
+    timeline_path: Path,
+    incident_id: str,
+) -> Stage5Result | None:
+    """
+    Attempt to resume Stage 5 from an existing timeline file.
+
+    Returns a Stage5Result reconstructed from disk if a valid checkpoint
+    exists. Returns None if no checkpoint is found, the file is missing,
+    or the file is corrupted — in all None cases the caller proceeds with
+    a full engine run.
+
+    Vault limitation
+    ----------------
+    The returned Stage5Result carries an empty SpeakerVault. The vault
+    cannot currently be restored from disk because _vault.json
+    deserialization is not yet implemented. Stage 6 reads the timeline
+    file directly and does not require the in-memory vault for re-scoring,
+    so this is acceptable for resume purposes.
+
+    Parameters
+    ----------
+    timeline_path : Path
+        Expected location of {incident_id}_timeline.json.
+    incident_id : str
+        Used for log messages only.
+
+    Returns
+    -------
+    Stage5Result | None
+        Reconstructed result if a valid checkpoint exists, else None.
+    """
+    if not timeline_path.exists():
+        return None
+
+    try:
+        data = json.loads(timeline_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(
+            "Stage 5: corrupted or unreadable checkpoint at %s (%s). "
+            "Overwriting with a fresh run.",
+            timeline_path.name, exc,
+        )
+        return None
+
+    status = data.get("status", "")
+    if status not in _RESUMABLE_STATUSES:
+        logger.debug(
+            "Stage 5: checkpoint status %r is not resumable — "
+            "proceeding with full run.",
+            status,
+        )
+        return None
+
+    logger.info(
+        "Stage 5: valid checkpoint found for %s (status=%r). "
+        "Skipping diarization engine.",
+        incident_id, status,
+    )
+
+    # Deserialize timeline segments from the checkpoint.
+    raw_segments = data.get("timeline", [])
+    timeline = [TimelineSegment.from_dict(s) for s in raw_segments]
+
+    # Reconstruct vault_metadata from what was written.
+    vault_metadata = {
+        "speakers": data.get("speakers", []),
+        "vault_quality": data.get("vault_quality", {}),
+        "vault_detail": {},  # Not persisted in timeline.json.
+    }
+
+    quality_summary = data.get("quality_summary", {})
+
+    return Stage5Result(
+        timeline=timeline,
+        vault=SpeakerVault(),       # Empty — vault not yet serialized to disk.
+        vault_metadata=vault_metadata,
+        intermediate_timeline_path=timeline_path,
+        chunk_count=data.get("chunk_count", 0),
+        total_speech_seconds=data.get("total_speech_seconds", 0.0),
+        snr_db_refined=quality_summary.get("snr_db_refined"),
+        snr_db_refined_classification=quality_summary.get("snr_db_refined_classification"),
+        low_anchor_confidence=data.get("low_anchor_confidence", False),
     )
 
 
@@ -732,7 +860,17 @@ def _write_timeline_json(
         "timeline": [seg.to_dict() for seg in timeline],
     }
 
-    output_path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    tmp_path = output_path.with_suffix(".json.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        # Atomic rename — the target file is never observed in a partial
+        # state. On POSIX this is a single syscall (rename(2)). On Windows
+        # it is atomic on the same volume. A crash before this line leaves
+        # the .tmp file on disk, which the checkpoint check ignores.
+        tmp_path.replace(output_path)
+    except Exception:
+        # Clean up the temp file if the write or rename failed.
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
