@@ -23,6 +23,7 @@ Contributors
     Do not add Phase 2+ logic to this file.
 """
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -348,8 +349,6 @@ def _run_diarize_pipeline(
     # Audio Extraction (between Stage 1 and Stage 2)
     # Status:  IMPLEMENTED
     # File:    src/utils/audio/extraction.py
-    # Produces a working PCM WAV from the original file so that
-    # soundfile can be used for all subsequent audio reads.
     # ------------------------------------------------------------------
     log.info("Audio Extraction — producing working WAV")
 
@@ -398,7 +397,6 @@ def _run_diarize_pipeline(
     # Stage 3 — Normalization
     # Status:  IMPLEMENTED
     # File:    src/utils/normalization/stage3.py
-    # Skipped automatically when stage1_result.passthrough is True.
     # ------------------------------------------------------------------
     log.info("Stage 3 — Normalization")
 
@@ -448,24 +446,94 @@ def _run_diarize_pipeline(
 
     # ------------------------------------------------------------------
     # Stage 5 — Windowed Diarization + Vault Matching
-    # Status:  NOT IMPLEMENTED
-    # Files:   src/diarization/engine.py, src/diarization/vault.py
+    # Status:  IMPLEMENTED
+    # File:    src/diarization/stage5.py
     # ------------------------------------------------------------------
     log.info("Stage 5 — Windowed Diarization + Vault Matching")
-    raise NotImplementedError(
-        "Stage 5 (Diarization + Vault Matching) is not yet implemented. "
-        "See Phase 1 spec Stage 5 and src/diarization/engine.py."
-    )
+
+    from src.diarization.stage5 import run_stage5
+
+    try:
+        stage5_result = run_stage5(
+            stage2_result=stage2_result,
+            stage3_result=stage3_result,
+            stage4_result=stage4_result,
+            output_dir=output_dir,
+            incident_id=incident_id,
+            chunk_size=float(chunk_size),
+        )
+    except ValueError as e:
+        # Raised by chunking.py when chunk_size <= CHUNK_OVERLAP.
+        # Should not occur given CLI min=30, but guard defensively.
+        raise click.ClickException(str(e)) from e
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+
+    if verbose:
+        vq = stage5_result.vault_metadata.get("vault_quality", {})
+        provisional = sum(
+            1 for seg in stage5_result.timeline if seg.is_provisional
+        )
+        snr_str = (
+            f"{stage5_result.snr_db_refined:.1f} dB "
+            f"({stage5_result.snr_db_refined_classification})"
+            if stage5_result.snr_db_refined is not None
+            else "unavailable"
+        )
+        console.print(
+            f"  [dim]segments:[/dim]       {len(stage5_result.timeline)}\n"
+            f"  [dim]speakers:[/dim]       "
+            f"{len(stage5_result.vault_metadata.get('speakers', []))}\n"
+            f"  [dim]chunks:[/dim]         {stage5_result.chunk_count}\n"
+            f"  [dim]speech:[/dim]         "
+            f"{stage5_result.total_speech_seconds:.1f}s\n"
+            f"  [dim]provisional:[/dim]    {provisional}\n"
+            f"  [dim]low anchor:[/dim]     {stage5_result.low_anchor_confidence}\n"
+            f"  [dim]vault purity:[/dim]   "
+            f"{vq.get('vault_purity_estimate', 0.0):.3f}\n"
+            f"  [dim]refined SNR:[/dim]    {snr_str}"
+        )
+        if stage5_result.low_anchor_confidence:
+            console.print(
+                "  [yellow]⚠ LOW_ANCHOR_CONFIDENCE — chaotic opening detected. "
+                "First-chunk segments flagged for Stage 6 re-scoring.[/yellow]"
+            )
+
+    # ------------------------------------------------------------------
+    # Write Stage 5 outputs
+    # vault.json is a CLI-level output concern — stage5.py writes only
+    # the intermediate timeline.json. The vault detail block is written
+    # here from vault_metadata, respecting the --no-vault flag.
+    # ------------------------------------------------------------------
+    if not dry_run and not no_vault:
+        vault_path = output_dir / f"{incident_id}_vault.json"
+        _write_vault_json(
+            vault_metadata=stage5_result.vault_metadata,
+            output_path=vault_path,
+            incident_id=incident_id,
+        )
+        if verbose:
+            console.print(
+                f"  [dim]vault:[/dim]          "
+                f"{vault_path.name} "
+                f"({vault_path.stat().st_size / 1024:.1f} KB)"
+            )
+
+    if dry_run:
+        log.info(
+            "Dry run — vault.json write skipped "
+            "(timeline.json was written by stage5.py)."
+        )
 
     # ------------------------------------------------------------------
     # Stage 6 — Retroactive Re-scoring
     # Status:  NOT IMPLEMENTED
-    # File:    src/diarization/engine.py  (same file as Stage 5)
+    # File:    src/diarization/stage6.py
     # ------------------------------------------------------------------
     log.info("Stage 6 — Retroactive Re-scoring")
     raise NotImplementedError(
         "Stage 6 (Retroactive Re-scoring) is not yet implemented. "
-        "See Phase 1 spec Stage 6 and src/diarization/engine.py."
+        "See Phase 1 spec Stage 6 and src/diarization/stage6.py."
     )
 
     # ------------------------------------------------------------------
@@ -498,3 +566,52 @@ def _run_diarize_pipeline(
     #     write_vault=not no_vault,
     #     write_timeline=not no_timeline,
     # )
+
+
+# ---------------------------------------------------------------------------
+# CLI output helpers
+# ---------------------------------------------------------------------------
+
+def _write_vault_json(
+    vault_metadata: dict,
+    output_path: Path,
+    incident_id: str,
+) -> None:
+    """
+    Write the vault detail JSON using the atomic write pattern.
+
+    Contains full embedding history per speaker and rejected embeddings
+    by reason. Consumed by Phase 4 Fusion. Suppressed by --no-vault.
+
+    Uses a .tmp → rename pattern: the target file is never left in a
+    partial state if the write is interrupted.
+
+    Parameters
+    ----------
+    vault_metadata : dict
+        Output of SpeakerVault.get_vault_metadata(). The "vault_detail"
+        key contains the full per-speaker embedding history.
+    output_path : Path
+        Destination path for the vault JSON.
+    incident_id : str
+        Written into the file header for traceability.
+    """
+    log = logging.getLogger(__name__)
+
+    payload = {
+        "incident_id": incident_id,
+        "speakers": vault_metadata.get("vault_detail", {}),
+        "vault_quality": vault_metadata.get("vault_quality", {}),
+    }
+
+    tmp_path = output_path.with_suffix(".json.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        tmp_path.replace(output_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+    log.info("Vault written → %s (%.1f KB)", output_path.name, output_path.stat().st_size / 1024)
