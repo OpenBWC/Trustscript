@@ -40,10 +40,21 @@ import numpy as np
 
 #: Cosine similarity threshold for matching an embedding to an existing anchor.
 #: Below this, the embedding is treated as a previously unseen speaker.
-#: Chosen to sit above the 0.05 ambiguity margin so near-misses do not
-#: collapse two speakers into one identity.
-#: Calibrate against a real BWC corpus — document dataset here when done.
-MATCH_THRESHOLD: float = 0.65
+#:
+#: CALIBRATION NOTE — pyannote/speaker-diarization-community-1:
+#: This model's ECAPA-TDNN embedding space has high intra-speaker cosine
+#: distance under BWC conditions. Observed mean intra-speaker pairwise
+#: distance on a clean single-speaker recording: 0.5157 → mean similarity
+#: ~0.48. With MATCH_THRESHOLD = 0.65, segments of the same speaker
+#: scoring below threshold are incorrectly routed to the new-anchor path,
+#: causing speaker fragmentation (one person appearing as multiple TRUST_SPK
+#: identities).
+#:
+#: Lowered to 0.45 based on observed embedding geometry. This captures
+#: same-speaker variation while still providing separation from genuinely
+#: different speakers. Calibrate against labelled BWC multi-speaker pairs
+#: and document the calibration corpus here when done.
+MATCH_THRESHOLD: float = 0.45
 
 #: Prefix for all global speaker IDs: TRUST_SPK_01, TRUST_SPK_02, ...
 SPEAKER_ID_PREFIX: str = "TRUST_SPK"
