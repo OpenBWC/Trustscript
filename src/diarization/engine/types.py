@@ -57,7 +57,7 @@ DEFAULT_CHUNK_SIZE: Final[float] = 300.0  # seconds
 
 #: Minimum segment duration to process. Below this, pyannote has produced a
 #: boundary sliver — no reliable embedding can be extracted.
-MIN_SEGMENT_DURATION: Final[float] = 0.1  # seconds
+MIN_SEGMENT_DURATION: Final[float] = 0.75  # seconds
 
 #: Minimum waveform / embedding L2 norm below which the signal is treated
 #: as silence or corruption. Prevents NaN cosine distances downstream.

@@ -252,8 +252,16 @@ def _process_chunk(
     # and crop() all live on the bare Annotation — unwrap before use.
     # Older model versions return the Annotation directly; the hasattr
     # fallback handles both without breaking either path.
-    if hasattr(result, "diarization"):
-        diarization: "Annotation" = result.diarization
+    # if hasattr(result, "diarization"):
+    #     diarization: "Annotation" = result.diarization
+    # elif hasattr(result, "annotation"):
+    #     diarization = result.annotation
+    # else:
+    #     diarization = result  # bare Annotation — older pipeline format
+        
+    # Step 2b — Unwrap DiarizeOutput → bare Annotation.
+    if hasattr(result, "speaker_diarization"):       # <--- FIX: "speaker_diarization"
+        diarization: "Annotation" = result.speaker_diarization
     elif hasattr(result, "annotation"):
         diarization = result.annotation
     else:
