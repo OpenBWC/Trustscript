@@ -228,13 +228,26 @@ def _process_chunk(
         chunk_idx, chunk_end - chunk_start,
     )
     try:
-        diarization: "Annotation" = pipeline(audio_input)
+        result = pipeline(audio_input)
     except Exception as exc:
         logger.error(
             "Chunk %d: pyannote diarization failed: %s — skipping chunk.",
             chunk_idx, exc,
         )
         return [], []
+
+    # pyannote/speaker-diarization-community-1 returns a DiarizeOutput
+    # dataclass rather than a bare Annotation. Unwrap to the standard
+    # pyannote.core.Annotation interface that itertracks() and
+    # get_overlap() live on.
+    # Older model versions return the Annotation directly — the hasattr
+    # checks handle both without breaking either path.
+    if hasattr(result, "diarization"):
+        diarization: "Annotation" = result.diarization
+    elif hasattr(result, "annotation"):
+        diarization = result.annotation
+    else:
+        diarization = result  # bare Annotation — older pipeline format
 
     # Step 3 — Powerset posteriors (internal API — see posteriors.py).
     posteriors: "SlidingWindowFeature | None" = extract_posteriors(pipeline, audio_input)
