@@ -14,9 +14,10 @@ Top-level orchestration only. Two functions:
         intervals. Returns EngineResult.
 
     _process_chunk()
-        Per-chunk coordinator. Loads audio, runs pyannote, extracts
-        posteriors and overlap timeline, computes the core window, then
-        calls Pass 1 → candidate preparation → Pass 2 in order.
+        Per-chunk coordinator. Loads audio, runs pyannote, unwraps
+        the pipeline output, extracts posteriors and overlap timeline,
+        computes the core window, then calls Pass 1 → candidate
+        preparation → Pass 2 in order.
 
 No extraction logic lives here. All per-segment work is delegated to:
     audio.py        — waveform I/O and embeddings
@@ -43,6 +44,15 @@ PCM WAV contract
 audio_path MUST be the Stage 3 normalized output: a pcm_s16le mono WAV.
 See audio.py module docstring for the full explanation of why compressed
 formats cause silent full-file RAM spikes that bypass all other guards.
+
+DiarizeOutput compatibility
+---------------------------
+pyannote/speaker-diarization-community-1 returns a DiarizeOutput
+dataclass rather than a bare pyannote.core.Annotation. All downstream
+code (itertracks, get_overlap, crop) expects a bare Annotation.
+_process_chunk unwraps the pipeline result immediately after the call
+via hasattr checks, handling both the community model format and the
+older bare-Annotation format without breaking either path.
 """
 
 from __future__ import annotations
@@ -51,9 +61,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import torch
-import torchaudio
 import soundfile as sf
+import torch
 
 from ..models import Stage4Result
 from ..vault import SpeakerVault
@@ -199,28 +208,29 @@ def _process_chunk(
     Full processing pipeline for one chunk.
 
     Sequence:
-        1. Load chunk audio (PCM WAV random access — see audio.py).
-        2. Run pyannote diarization.
-        3. Extract powerset posteriors (second forward pass — see posteriors.py).
-        4. Get precomputed overlap timeline from pyannote.
-        5. Compute core window for seam management.
-        6. Pass 1: collect_raw_segments().
-        7. Build Gate 3 candidate pools.
-        8. Resolve local speaker conflicts.
-        9. Pass 2: run_vault_matching().
+        1.  Load chunk audio (PCM WAV random access — see audio.py).
+        2.  Run pyannote diarization.
+        2b. Unwrap DiarizeOutput → bare Annotation (community model compat).
+        3.  Extract powerset posteriors (second forward pass).
+        4.  Get precomputed overlap timeline from pyannote.
+        5.  Compute core window for seam management.
+        6.  Pass 1: collect_raw_segments().
+        7.  Build Gate 3 candidate pools.
+        8.  Resolve local speaker conflicts.
+        9.  Pass 2: run_vault_matching().
         10. Extract speech intervals for refined SNR.
 
     Returns
     -------
     tuple[list[TimelineSegment], list[tuple[float, float]]]
-        (accepted segments, speech intervals)
+        (accepted segments, speech intervals as (start_sec, end_sec))
     """
     # Step 1 — Audio load.
     chunk_waveform = load_chunk_audio(audio_path, chunk_start, chunk_end, sample_rate)
     audio_input = {"waveform": chunk_waveform, "sample_rate": sample_rate}
 
     # Step 2 — Diarization.
-    # Blocking CPU call — 10–30 min per 5-min chunk on ARM.
+    # Blocking CPU call — 2–10 min per chunk on ARM depending on chunk size.
     # No progress feedback from pyannote during this call.
     logger.info(
         "Chunk %d: running pyannote inference (%.0fs of audio) — "
@@ -236,12 +246,12 @@ def _process_chunk(
         )
         return [], []
 
+    # Step 2b — Unwrap DiarizeOutput → bare Annotation.
     # pyannote/speaker-diarization-community-1 returns a DiarizeOutput
-    # dataclass rather than a bare Annotation. Unwrap to the standard
-    # pyannote.core.Annotation interface that itertracks() and
-    # get_overlap() live on.
-    # Older model versions return the Annotation directly — the hasattr
-    # checks handle both without breaking either path.
+    # dataclass rather than a bare Annotation. itertracks(), get_overlap(),
+    # and crop() all live on the bare Annotation — unwrap before use.
+    # Older model versions return the Annotation directly; the hasattr
+    # fallback handles both without breaking either path.
     if hasattr(result, "diarization"):
         diarization: "Annotation" = result.diarization
     elif hasattr(result, "annotation"):
@@ -306,7 +316,9 @@ def _process_chunk(
         vault=vault,
     )
 
-    # Step 10 — Speech intervals for refined SNR.
+    # Step 10 — Speech intervals for refined SNR (float seconds).
+    # stage5._compute_refined_snr() converts to sample offsets internally
+    # using int(sec * sample_rate) — no precision issue at the SNR calc.
     speech_intervals = [
         (seg.start_seconds, seg.end_seconds)
         for seg in matched_segments
