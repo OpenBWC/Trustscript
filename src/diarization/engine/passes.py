@@ -13,10 +13,24 @@ Responsibility
         Does NOT modify vault state.
 
     run_vault_matching()    — Pass 2
-        Calls vault.match_or_create() for each _RawSegment in order.
-        After all assignments are made, resolves overlap_speakers from
-        chunk-local labels to global IDs using the label→global map
-        built during this pass.
+        Two sub-phases:
+
+        Pass 2a — Match and vote:
+            Calls vault.match_or_create() for each _RawSegment in order.
+            Accumulates a Counter per local label tracking every global
+            ID assigned to segments under that label in this chunk.
+
+        Pass 2b — Resolve overlap_speakers:
+            Determines the dominant global ID per local label (most
+            common Counter outcome). Uses that map to resolve
+            overlap_speakers from chunk-local labels to global IDs.
+
+        Dominant-ID resolution prevents a single outlier assignment
+        late in the chunk from overwriting the plurality identity and
+        corrupting overlap_speakers attribution for all prior segments.
+        Example: 9 segments under SPEAKER_00 → TRUST_SPK_01, 1 outlier
+        → TRUST_SPK_05. Resolved map uses TRUST_SPK_01, not TRUST_SPK_05
+        just because it appeared last chronologically.
 
 Why two passes?
 ---------------
@@ -24,9 +38,10 @@ Pass 1 must complete before Pass 2 can begin because:
     1. candidates.build_candidates_by_label() needs all non-overlap
        segments across the whole chunk to build stable Gate 3 pools.
     2. candidates.resolve_local_conflicts() needs all per-label pools
-       to score mean embeddings and detect vault collisions.
+       to score mean embeddings and detect vault collisions. The
+       anti-merge exclusion set also requires the full segment picture.
 
-If vault.match_or_create() ran inside the Pass 1 loop, both of these
+If vault.match_or_create() ran inside the Pass 1 loop, all of these
 would evaluate partial evidence and produce unreliable Gate 3 results.
 
 The two-pass design is what separates this from a naive implementation.
@@ -35,6 +50,7 @@ The two-pass design is what separates this from a naive implementation.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import TYPE_CHECKING
 
 from ..segment import (
@@ -86,6 +102,10 @@ def collect_raw_segments(
            (overlap segments only, when posteriors are available).
         7. Set overlap flags (CONCURRENT_SPEECH, GHOST_SPEAKER).
 
+    concurrency_confidence is stored on the TimelineSegment directly.
+    It travels inside _RawSegment.segment and does not need a duplicate
+    field on _RawSegment itself.
+
     Does NOT modify vault state.
 
     Parameters
@@ -117,7 +137,6 @@ def collect_raw_segments(
     -------
     list[_RawSegment]
         All accepted segments from Pass 1, in annotation order.
-        candidate_embeddings is [] for all — populated by candidates.py.
     """
     raw: list[_RawSegment] = []
 
@@ -171,6 +190,8 @@ def collect_raw_segments(
         )
 
         # concurrency_confidence from powerset posteriors.
+        # Stored on TimelineSegment — no duplicate field on _RawSegment.
+        # Downstream phases must treat None as UNKNOWN (see posteriors.py).
         concurrency_confidence: float | None = None
         if is_overlap and posteriors is not None and overlap_class_indices:
             concurrency_confidence = concurrency_confidence_for_segment(
@@ -199,7 +220,7 @@ def collect_raw_segments(
             local_speaker_label=local_speaker,
             reid_score=None,
             overlap=is_overlap,
-            overlap_speakers=[],          # Resolved after Pass 2.
+            overlap_speakers=[],          # Resolved in Pass 2b.
             concurrency_confidence=concurrency_confidence,
             flags=flags,
             chunk_index=chunk_idx,
@@ -221,17 +242,33 @@ def run_vault_matching(
     vault: SpeakerVault,
 ) -> list[TimelineSegment]:
     """
-    Pass 2: call vault.match_or_create() for each segment in order.
+    Pass 2: vault matching with dominant-ID resolution for overlap_speakers.
 
-    Builds a label→global mapping as assignments are made. After all
-    segments are matched, resolves overlap_speakers from chunk-local
-    labels (stored in _RawSegment.overlap_local_labels) to global IDs
-    using that mapping.
+    Pass 2a — Match and vote:
+        Calls vault.match_or_create() for each segment. Accumulates a
+        Counter per local label tracking every global ID assigned to
+        segments under that label in this chunk.
 
-    Segments whose speaker could not be resolved (UNKNOWN, UNASSIGNED)
-    are not added to label_to_global, so their local labels appear
-    verbatim in overlap_speakers as a fallback. This preserves
-    auditability without crashing on unresolved labels.
+    Pass 2b — Resolve overlap_speakers:
+        Determines the dominant global ID per local label (most common
+        Counter outcome). Uses the resolved map to convert local labels
+        in overlap_speakers to global IDs.
+
+    Dominant-ID resolution prevents a single outlier assignment
+    late in the chunk from overwriting the plurality identity and
+    corrupting overlap_speakers attribution for all prior segments.
+    Example: 9 segments under SPEAKER_00 → TRUST_SPK_01, 1 outlier
+    → TRUST_SPK_05. Resolved map uses TRUST_SPK_01, not TRUST_SPK_05
+    just because it appeared last chronologically.
+
+    Segments with no confirmed assignment (UNKNOWN, UNASSIGNED) do
+    not contribute votes. Their local labels fall back to the dominant
+    ID from other segments for that label, or remain as the raw local
+    label if no confirmed assignment exists — preserving auditability
+    without crashing on unresolved labels.
+
+    Pass 2b runs after Pass 2a completes so resolved_label_map is
+    fully populated before any overlap_speakers are written.
 
     Parameters
     ----------
@@ -248,8 +285,12 @@ def run_vault_matching(
         Matched segments with global speaker IDs and confidence flags.
     """
     matched: list[TimelineSegment] = []
-    label_to_global: dict[str, str] = {}
+    # Counter per local label — tracks all global IDs assigned to it.
+    # Dominant ID (most common) prevents outlier assignments from
+    # corrupting overlap_speakers attribution across the chunk.
+    label_to_global_votes: dict[str, Counter] = {}
 
+    # ── Pass 2a: vault matching and vote accumulation ─────────────────────
     for raw in raw_segments:
         seg = raw.segment
         candidates = candidates_by_label.get(seg.local_speaker_label, [])
@@ -261,18 +302,28 @@ def run_vault_matching(
             candidate_embeddings=candidates,
         )
 
-        # Record confirmed global IDs for overlap_speakers resolution.
+        # Accumulate votes for confirmed global IDs only.
         if seg.speaker not in ("UNKNOWN", "UNASSIGNED", "OVERLAP"):
-            label_to_global[seg.local_speaker_label] = seg.speaker
+            local_lbl = seg.local_speaker_label
+            if local_lbl not in label_to_global_votes:
+                label_to_global_votes[local_lbl] = Counter()
+            label_to_global_votes[local_lbl][seg.speaker] += 1
 
         matched.append(seg)
 
-    # Resolve overlap_speakers: local labels → global IDs.
-    # Runs after all segments so label_to_global is fully populated.
+    # Resolve dominant global ID per local label.
+    # most_common(1) returns [(id, count)] — take the id.
+    resolved_label_map: dict[str, str] = {
+        local_lbl: counter.most_common(1)[0][0]
+        for local_lbl, counter in label_to_global_votes.items()
+    }
+
+    # ── Pass 2b: resolve overlap_speakers using dominant IDs ──────────────
+    # Runs after Pass 2a so resolved_label_map is fully populated.
     for raw in raw_segments:
         if raw.overlap_local_labels:
             raw.segment.overlap_speakers = [
-                label_to_global.get(lbl, lbl)
+                resolved_label_map.get(lbl, lbl)
                 for lbl in raw.overlap_local_labels
             ]
 
