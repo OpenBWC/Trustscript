@@ -93,8 +93,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import soundfile as sf
 import torch
-import torchaudio
 
 from .engine import DEFAULT_CHUNK_SIZE, EngineResult, run_windowed_diarization
 from .models import Stage4Result
@@ -228,6 +228,7 @@ def run_stage5(
     output_dir: Path,
     incident_id: str,
     chunk_size: float = DEFAULT_CHUNK_SIZE,
+    dry_run: bool = False,
 ) -> Stage5Result:
     """
     Execute Stage 5: Windowed Diarization + Vault Matching.
@@ -257,6 +258,11 @@ def run_stage5(
     chunk_size : float
         Chunk duration in seconds. Default: 300.0 (5 minutes).
         Must be > CHUNK_OVERLAP (10.0s) — engine raises ValueError if not.
+    dry_run : bool
+        If True, skip writing the intermediate timeline JSON to disk.
+        The engine still runs and Stage5Result is returned normally —
+        only the file write is suppressed. Checkpoint interception still
+        runs even in dry_run mode to avoid redundant computation.
 
     Returns
     -------
@@ -400,25 +406,28 @@ def run_stage5(
 
     # ------------------------------------------------------------------
     # Write intermediate timeline JSON.
-    # Stage 6 reads this file. Stage 7 reads Stage 6's updated version.
+    # Skipped in dry_run mode — no artifacts written to disk.
+    # Stage 6 reads this file; a dry run has no downstream stages.
     # ------------------------------------------------------------------
     timeline_path = output_dir / f"{incident_id}{_TIMELINE_SUFFIX}"
-    _write_timeline_json(
-        timeline=timeline,
-        vault_metadata=vault_metadata,
-        output_path=timeline_path,
-        incident_id=incident_id,
-        chunk_count=engine_result.chunk_count,
-        total_speech_seconds=engine_result.total_speech_seconds,
-        low_anchor_confidence=low_anchor_confidence,
-        snr_db_refined=snr_db_refined,
-        snr_db_refined_classification=snr_db_refined_classification,
-    )
-    logger.info(
-        "Stage 5: timeline written → %s (%.1f KB).",
-        timeline_path.name,
-        timeline_path.stat().st_size / 1024,
-    )
+    if not dry_run:
+        _write_timeline_json(
+            timeline=timeline,
+            vault_metadata=vault_metadata,
+            output_path=timeline_path,
+            incident_id=incident_id,
+            chunk_count=engine_result.chunk_count,
+            total_speech_seconds=engine_result.total_speech_seconds,
+            low_anchor_confidence=low_anchor_confidence,
+            snr_db_refined=snr_db_refined,
+            snr_db_refined_classification=snr_db_refined_classification,
+        )
+        logger.info("Stage 5: timeline written → %s", timeline_path.name)
+    else:
+        logger.info(
+            "Stage 5: dry_run=True — skipping timeline write (%s).",
+            timeline_path.name,
+        )
 
     provisional_count = sum(1 for seg in timeline if seg.is_provisional)
     logger.info(
@@ -710,14 +719,16 @@ def _compute_refined_snr(
         return None, None
 
     try:
-        with torch.no_grad():
-            waveform, sample_rate = torchaudio.load(str(normalized_path))
-
-        # Guarantee mono — Stage 3 should have ensured this already.
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-
-        waveform_np: np.ndarray = waveform.squeeze(0).numpy()
+        # soundfile reads the PCM WAV directly — no torchaudio backend,
+        # no torchcodec, no FFmpeg dependency. always_2d guarantees
+        # (num_samples, num_channels) shape even for mono files.
+        data, sample_rate = sf.read(
+            str(normalized_path),
+            dtype="float32",
+            always_2d=True,
+        )
+        # Take the first channel — Stage 3 guarantees mono output.
+        waveform_np: np.ndarray = data[:, 0]
         num_samples = len(waveform_np)
 
         # Build boolean speech mask from speech_intervals.
