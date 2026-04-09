@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torchaudio
+import soundfile as sf
 
 from ..models import Stage4Result
 from ..vault import SpeakerVault
@@ -105,10 +106,12 @@ def run_windowed_diarization(
     pipeline = stage4_result.pipeline
     embed_inference = stage4_result.embed_inference
 
-    # Read audio metadata once — reused for all chunk loads.
-    audio_info = torchaudio.info(str(audio_path))
-    sample_rate: int = audio_info.sample_rate
-    audio_duration: float = audio_info.num_frames / sample_rate
+    # Read audio metadata using soundfile — more reliable than torchaudio.info()
+    # across CPU-only wheel versions. The file is guaranteed to be a pcm_s16le
+    # mono WAV from Stage 3, which soundfile reads without backend dependencies.
+    sf_info = sf.info(str(audio_path))
+    sample_rate: int = sf_info.samplerate
+    audio_duration: float = sf_info.frames / sf_info.samplerate
 
     logger.info(
         "Engine: audio=%.2fs @ %dHz, chunk=%.0fs, overlap=10s",
