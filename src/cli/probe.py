@@ -105,15 +105,27 @@ def probe(input_path: str, token: str | None, models_dir: str | None, verbose: b
         console.print(f"[red]Preprocessing failed: {e}[/red]")
         sys.exit(1)
 
-    # ------------------------------------------------------------------
+   # ------------------------------------------------------------------
     # SANDBOX INFERENCE
     # ------------------------------------------------------------------
     console.print("\n[bold yellow]Preprocessing complete. Starting full-file inference...[/bold yellow]")
     console.print("[dim](This may take several minutes depending on file length and hardware)[/dim]")
 
     try:
-        # Run standard diarization
-        raw_output = pipeline(str(normalized_wav))
+        import soundfile as sf
+        import torch
+        
+        # 1. Load the entire file using soundfile to bypass torchaudio/torchcodec bugs
+        data, sample_rate = sf.read(str(normalized_wav), dtype="float32", always_2d=True)
+        
+        # 2. Convert to PyTorch Tensor shape (channels, samples)
+        waveform = torch.from_numpy(data.T)
+        
+        # 3. Create the dictionary input Pyannote expects
+        audio_input = {"waveform": waveform, "sample_rate": sample_rate}
+
+        # 4. Run standard diarization
+        raw_output = pipeline(audio_input)
     except Exception as e:
         console.print(f"[red]Inference failed: {e}[/red]")
         sys.exit(1)
@@ -128,7 +140,8 @@ def probe(input_path: str, token: str | None, models_dir: str | None, verbose: b
     # Extract Raw Probabilities
     console.print("\n[bold cyan]=== RAW SEGMENTATION PROBABILITIES ===[/bold cyan]")
     try:
-        posteriors = pipeline._segmentation(str(normalized_wav))
+        # Note: we pass the audio_input dictionary here too, not the filepath!
+        posteriors = pipeline._segmentation(audio_input)
         data = posteriors.data  # shape: (frames, speakers)
         frames, speakers = data.shape
         
