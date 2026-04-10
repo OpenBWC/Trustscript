@@ -396,26 +396,55 @@ def _run_diarize_pipeline(
 
     # ------------------------------------------------------------------
     # Stage 3 — Normalization
-    # Status:  NOT IMPLEMENTED
-    # File:    src/utils/audio/normalization.py  (to be created)
-    # Note:    Skip this stage when stage1_result.passthrough is True.
+    # Status:  IMPLEMENTED
+    # File:    src/utils/normalization/stage3.py
+    # Skipped automatically when stage1_result.passthrough is True.
     # ------------------------------------------------------------------
     log.info("Stage 3 — Normalization")
-    raise NotImplementedError(
-        "Stage 3 (Normalization) is not yet implemented. "
-        "See Phase 1 spec Stage 3 and src/utils/audio/normalization.py."
-    )
+
+    from src.utils.normalization import run_stage3
+
+    try:
+        stage3_result = run_stage3(
+            stage1_result=stage1_result,
+            working_audio_path=working_audio_path,
+            output_dir=output_dir,
+            incident_id=incident_id,
+        )
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+
+    if verbose:
+        console.print(
+            f"  [dim]normalized:[/dim]    {stage3_result.normalized_path.name}\n"
+            f"  [dim]skipped:[/dim]       {stage3_result.normalization_skipped}\n"
+            f"  [dim]applied:[/dim]       "
+            f"{', '.join(stage3_result.normalization_applied) or 'none'}"
+        )
 
     # ------------------------------------------------------------------
     # Stage 4 — Model Loading
-    # Status:  NOT IMPLEMENTED
+    # Status:  IMPLEMENTED
     # File:    src/diarization/models.py
     # ------------------------------------------------------------------
     log.info("Stage 4 — Model Loading")
-    raise NotImplementedError(
-        "Stage 4 (Model Loading) is not yet implemented. "
-        "See Phase 1 spec Stage 4 and src/diarization/models.py."
-    )
+
+    from src.diarization.models import run_stage4
+
+    try:
+        stage4_result = run_stage4(
+            token=token,
+            models_dir=Path(models_dir) if models_dir else None,
+        )
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+
+    if verbose:
+        console.print(
+            f"  [dim]diarization model:[/dim] {stage4_result.diarization_model_id}\n"
+            f"  [dim]embedding model:[/dim]   {stage4_result.embedding_model_id}\n"
+            f"  [dim]local weights:[/dim]     {stage4_result.loaded_from_local}"
+        )
 
     # ------------------------------------------------------------------
     # Stage 5 — Windowed Diarization + Vault Matching
