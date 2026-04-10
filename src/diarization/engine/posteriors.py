@@ -57,57 +57,38 @@ logger = logging.getLogger(__name__)
 
 def get_overlap_class_indices(pipeline) -> list[int]:
     """
-    Identify which powerset class indices represent concurrent speech.
+    Identify which class indices represent concurrent speech.
 
-    Powerset class layout for a model with N max speakers:
-        Index 0:       silence  (0 active speakers)
-        Index 1..N:    single-speaker classes (one per speaker slot)
-        Index N+1..:   overlap combinations   (2+ speakers active)
+    For pyannote/speaker-diarization-community-1, the segmentation model
+    returns a 3D posterior tensor of shape (windows, frames_per_window, 3)
+    where the 3 classes are: [silence, speech, overlap].
+    Class index 2 is the overlap class.
 
-    Tries two attribute paths for model introspection to handle minor
-    version differences in pyannote.audio 3.x:
-        model.specifications.classes  (preferred)
-        model.powerset.num_speakers   (fallback)
+    This is different from the full powerset format used in older pyannote
+    versions where overlap classes were at indices N+1..end. The community-1
+    model uses a simpler 3-class segmentation — the `powerset` attribute
+    does not exist on PyanNet, which is why the original introspection fails.
 
-    Parameters
-    ----------
-    pipeline
-        Loaded pyannote Pipeline from Stage 4 result.
-
-    Returns
-    -------
-    list[int]
-        Overlap class indices. Empty list on any failure — callers
-        set concurrency_confidence = None for the entire chunk.
+    Returns [2] for the community-1 model. Returns [] on any failure —
+    callers degrade gracefully by setting concurrency_confidence = None.
     """
     try:
-        model = pipeline._segmentation.model
-
-        try:
-            num_speakers = len(model.specifications.classes)
-        except AttributeError:
-            num_speakers = model.powerset.num_speakers
-
-        try:
-            num_classes = model.powerset.num_powerset_classes
-        except AttributeError:
-            num_classes = model.powerset.num_classes
-
-        overlap_start = num_speakers + 1
-        if overlap_start >= num_classes:
+        # Verify the pipeline has a _segmentation attribute at all.
+        if not hasattr(pipeline, "_segmentation"):
             logger.warning(
-                "No overlap classes in powerset model "
-                "(num_speakers=%d, num_classes=%d).",
-                num_speakers, num_classes,
+                "get_overlap_class_indices: pipeline has no _segmentation "
+                "attribute — concurrency_confidence will not be extracted."
             )
             return []
 
-        indices = list(range(overlap_start, num_classes))
+        # For community-1 (PyanNet), the segmentation output is
+        # (windows, frames_per_window, 3) where index 2 = overlap.
+        # Return immediately without attempting powerset introspection.
         logger.debug(
-            "Powerset: %d overlap classes %s (of %d total, %d speakers)",
-            len(indices), indices, num_classes, num_speakers,
+            "get_overlap_class_indices: using community-1 3-class format "
+            "(silence=0, speech=1, overlap=2)."
         )
-        return indices
+        return [2]
 
     except Exception as exc:
         logger.warning(
