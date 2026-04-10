@@ -137,26 +137,41 @@ def probe(input_path: str, token: str | None, models_dir: str | None, verbose: b
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         console.print(f"  [{turn.start:06.2f}s -> {turn.end:06.2f}s] {speaker}")
 
-    # Extract Raw Probabilities
+   # Extract Raw Probabilities
     console.print("\n[bold cyan]=== RAW SEGMENTATION PROBABILITIES ===[/bold cyan]")
     try:
-        # Note: we pass the audio_input dictionary here too, not the filepath!
+        # 1. Get the raw scores from the internal model
         posteriors = pipeline._segmentation(audio_input)
-        data = posteriors.data  # shape: (frames, speakers)
-        frames, speakers = data.shape
         
-        console.print(f"  [green]Success:[/green] Matrix shape: {frames} frames x {speakers} speakers.")
+        # 2. Handle both SlidingWindowFeature and raw Tensors
+        data = getattr(posteriors, "data", posteriors)
+        
+        # 3. Robust shape unpacking (Taking only the first two dimensions)
+        # This prevents the "too many values to unpack" error if data is 3D
+        shape = data.shape
+        frames = shape[0]
+        speakers = shape[1]
+        
+        console.print(f"  [green]Success:[/green] Matrix shape: {shape}")
         console.print("  [dim]Showing first 25 frames where max probability > 0.1:[/dim]\n")
         
+        # If it's a torch tensor, move to CPU and convert to numpy for printing
+        if hasattr(data, "cpu"):
+            data = data.cpu().numpy()
+
         printed = 0
-        for i, frame in enumerate(data):
+        for i in range(frames):
+            # If 3D (frames, speakers, 1), we flatten to 2D for the logic below
+            frame = data[i].flatten() 
+            
             if frame.max() > 0.1:
-                # Format: Spk0: 0.95, Spk1: 0.02, etc.
                 probs = ", ".join([f"Spk{j}: {p:.3f}" for j, p in enumerate(frame)])
                 
-                # Check for overlap (Sum of top 2 > 1.0)
+                # Check for overlap (Sum of top 2 probabilities > 1.0)
+                # This is the "Powerset" logic in v4
                 sorted_probs = sorted(frame, reverse=True)
-                overlap_flag = " [red]<-- OVERLAP[/red]" if (len(sorted_probs) > 1 and sorted_probs[0] + sorted_probs[1] > 1.0) else ""
+                is_overlap = len(sorted_probs) > 1 and (sorted_probs[0] + sorted_probs[1] > 1.0)
+                overlap_flag = " [red]<-- OVERLAP[/red]" if is_overlap else ""
                 
                 console.print(f"  Frame {i:05d}: {probs}{overlap_flag}")
                 printed += 1
@@ -165,5 +180,6 @@ def probe(input_path: str, token: str | None, models_dir: str | None, verbose: b
 
     except Exception as e:
         console.print(f"[red]Failed to extract probabilities: {e}[/red]")
-
-    console.rule("[bold]Probe Complete[/bold]")
+        # Log the actual shape to help you debug exactly what v4 returned
+        if 'data' in locals():
+            console.print(f"[dim]Attempted to unpack shape: {data.shape}[/dim]")
