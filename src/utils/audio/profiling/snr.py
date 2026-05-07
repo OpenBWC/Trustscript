@@ -3,6 +3,8 @@ src/utils/audio/snr.py
 =======================
 TrustScript Phase 1 — Stage 2 SNR Computation
 
+Overhaul Coming: I will be pitvoting away from the average methodology soon
+
 Responsibility
 --------------
 All Signal-to-Noise Ratio computation for Stage 2:
